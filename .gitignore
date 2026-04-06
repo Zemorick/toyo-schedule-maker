@@ -1,0 +1,5 @@
+__pycache__/
+toyo_data/
+venv/
+*.xlsx
+*.pdf
