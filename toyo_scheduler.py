@@ -1306,46 +1306,84 @@ class ToyoSchedulerApp:
         for widget in self.avail_frame.winfo_children():
             widget.destroy()
 
-        # Headers
-        ttk.Label(self.avail_frame, text="Staff", font=("Helvetica", 10, "bold"),
-                 width=15).grid(row=0, column=0, padx=5, pady=3)
-        ttk.Label(self.avail_frame, text="Role", font=("Helvetica", 10, "bold"),
-                 width=10).grid(row=0, column=1, padx=5, pady=3)
-        for di, day in enumerate(DAYS):
-            ttk.Label(self.avail_frame, text=day, font=("Helvetica", 10, "bold"),
-                     width=10).grid(row=0, column=di + 2, padx=3, pady=3)
-
         self.avail_vars = {}
         options = ["off", "morning", "night", "both"]
 
         active = [s for s in self.data.staff if s["active"]
                   and "emergency_only" not in s.get("flags", [])]
-        # Sort: fixed schedule first, then by name
-        active.sort(key=lambda s: (0 if s.get("fixed_schedule") else 1, s["name"]))
 
-        for ri, staff in enumerate(active):
-            name = staff["name"]
-            ttk.Label(self.avail_frame, text=name, width=15).grid(
-                row=ri + 1, column=0, padx=5, pady=2, sticky="w")
-            role_str = "/".join(staff["roles"])
-            ttk.Label(self.avail_frame, text=role_str, width=10).grid(
-                row=ri + 1, column=1, padx=5, pady=2)
+        # Split into servers and hosts
+        servers = [s for s in active if "server" in s["roles"]]
+        hosts = [s for s in active if "host" in s["roles"] and "server" not in s["roles"]]
+        dual = [s for s in active if "server" in s["roles"] and "host" in s["roles"]]
 
-            self.avail_vars[name] = {}
+        # Sort each group: fixed schedule first, then by name
+        for group in (servers, hosts, dual):
+            group.sort(key=lambda s: (0 if s.get("fixed_schedule") else 1, s["name"]))
+
+        row = 0
+
+        def add_section_header(row, title):
+            ttk.Label(self.avail_frame, text=title,
+                     font=("Helvetica", 11, "bold"), foreground="navy").grid(
+                row=row, column=0, columnspan=9, padx=5, pady=(10, 3), sticky="w")
+            return row + 1
+
+        def add_column_headers(row):
+            ttk.Label(self.avail_frame, text="Name", font=("Helvetica", 10, "bold"),
+                     width=15).grid(row=row, column=0, padx=5, pady=3)
             for di, day in enumerate(DAYS):
-                saved_val = self.data.availability.get(name, {}).get(day, "off")
-                # Default fixed-schedule staff to "both", except their default off days
-                if staff.get("fixed_schedule") and saved_val == "off":
-                    default_off = staff.get("default_off", [])
-                    if day in default_off:
-                        saved_val = "off"
-                    else:
-                        saved_val = "both"
-                var = tk.StringVar(value=saved_val)
-                self.avail_vars[name][day] = var
-                combo = ttk.Combobox(self.avail_frame, textvariable=var,
-                                    values=options, state="readonly", width=8)
-                combo.grid(row=ri + 1, column=di + 2, padx=3, pady=2)
+                ttk.Label(self.avail_frame, text=day, font=("Helvetica", 10, "bold"),
+                         width=10).grid(row=row, column=di + 2, padx=3, pady=3)
+            return row + 1
+
+        def add_staff_rows(row, staff_list):
+            for staff in staff_list:
+                name = staff["name"]
+                ttk.Label(self.avail_frame, text=name, width=15).grid(
+                    row=row, column=0, padx=5, pady=2, sticky="w")
+
+                self.avail_vars[name] = {}
+                for di, day in enumerate(DAYS):
+                    saved_val = self.data.availability.get(name, {}).get(day, "off")
+                    # Default fixed-schedule staff to "both", except their default off days
+                    if staff.get("fixed_schedule") and saved_val == "off":
+                        default_off = staff.get("default_off", [])
+                        if day in default_off:
+                            saved_val = "off"
+                        else:
+                            saved_val = "both"
+                    var = tk.StringVar(value=saved_val)
+                    self.avail_vars[name][day] = var
+                    combo = ttk.Combobox(self.avail_frame, textvariable=var,
+                                        values=options, state="readonly", width=8)
+                    combo.grid(row=row, column=di + 2, padx=3, pady=2)
+                row += 1
+            return row
+
+        # --- Servers section ---
+        row = add_section_header(row, "SERVERS")
+        row = add_column_headers(row)
+        row = add_staff_rows(row, servers)
+
+        # --- Separator ---
+        ttk.Separator(self.avail_frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=9, sticky="ew", pady=8)
+        row += 1
+
+        # --- Hosts section ---
+        row = add_section_header(row, "HOSTS")
+        row = add_column_headers(row)
+        row = add_staff_rows(row, hosts)
+
+        # --- Dual role section (if any) ---
+        if dual:
+            ttk.Separator(self.avail_frame, orient="horizontal").grid(
+                row=row, column=0, columnspan=9, sticky="ew", pady=8)
+            row += 1
+            row = add_section_header(row, "DUAL ROLE (Server/Host)")
+            row = add_column_headers(row)
+            row = add_staff_rows(row, dual)
 
     def _set_all_available(self):
         for name, days in self.avail_vars.items():
