@@ -120,6 +120,21 @@ DEFAULT_STAFF = [
     # Emergency / special
     {"name": "Ross", "roles": ["server", "host"], "seniority": 3, "fixed_schedule": False,
      "active": True, "flags": ["emergency_only"], "role_preference": None},
+    # Managers
+    {"name": "Aaron", "roles": ["manager"], "seniority": 10, "fixed_schedule": True,
+     "active": True, "flags": [], "role_preference": "manager",
+     "default_availability": {
+         "MON": "both", "TUE": "off",
+         "WED": "night", "THU": "night",
+         "FRI": "both", "SAT": "both", "SUN": "both",
+     }},
+    {"name": "Chan", "roles": ["manager"], "seniority": 10, "fixed_schedule": True,
+     "active": True, "flags": [], "role_preference": "manager",
+     "default_availability": {
+         "MON": "off", "TUE": "both",
+         "WED": "morning", "THU": "morning", "FRI": "morning",
+         "SAT": "off", "SUN": "off",
+     }},
 ]
 
 DEFAULT_CONFIG = {
@@ -242,10 +257,35 @@ class ScheduleGenerator:
                 else:
                     self.schedule[day][key] = ""
 
-        # Step 1: Place managers
+        # Step 1: Place managers based on their availability
         for day in DAYS:
-            self.schedule[day]["lunch_manager"] = config["managers"].get("lunch", "Aaron")
-            self.schedule[day]["dinner_manager"] = config["managers"].get("dinner", "Aaron")
+            aaron_avail = self._get_availability("Aaron", day)
+            chan_avail = self._get_availability("Chan", day)
+
+            aaron_morning = aaron_avail in ("morning", "both")
+            aaron_night = aaron_avail in ("night", "both")
+            chan_morning = chan_avail in ("morning", "both")
+            chan_night = chan_avail in ("night", "both")
+
+            # Lunch manager(s)
+            lunch_mgrs = []
+            if aaron_morning:
+                lunch_mgrs.append("Aaron")
+            if chan_morning:
+                lunch_mgrs.append("Chan")
+            if not lunch_mgrs:
+                lunch_mgrs.append(config["managers"].get("lunch", "Aaron"))
+            self.schedule[day]["lunch_manager"] = "/".join(lunch_mgrs)
+
+            # Dinner manager(s)
+            dinner_mgrs = []
+            if aaron_night:
+                dinner_mgrs.append("Aaron")
+            if chan_night:
+                dinner_mgrs.append("Chan")
+            if not dinner_mgrs:
+                dinner_mgrs.append(config["managers"].get("dinner", "Aaron"))
+            self.schedule[day]["dinner_manager"] = "/".join(dinner_mgrs)
 
         # Step 2: Place fixed schedule staff (Diane & Leony)
         self._place_fixed_staff(avail, config)
@@ -1312,10 +1352,10 @@ class ToyoSchedulerApp:
         active = [s for s in self.data.staff if s["active"]
                   and "emergency_only" not in s.get("flags", [])]
 
-        # Split into servers and hosts
-        servers = [s for s in active if "server" in s["roles"]]
-        hosts = [s for s in active if "host" in s["roles"] and "server" not in s["roles"]]
-        dual = [s for s in active if "server" in s["roles"] and "host" in s["roles"]]
+        # Split into servers, hosts, dual-role, and managers
+        servers = [s for s in active if "server" in s["roles"] and "host" not in s["roles"] and "manager" not in s["roles"]]
+        hosts = [s for s in active if "host" in s["roles"] and "server" not in s["roles"] and "manager" not in s["roles"]]
+        dual = [s for s in active if "server" in s["roles"] and "host" in s["roles"] and "manager" not in s["roles"]]
 
         # Sort each group: fixed schedule first, then by name
         for group in (servers, hosts, dual):
@@ -1346,13 +1386,19 @@ class ToyoSchedulerApp:
                 self.avail_vars[name] = {}
                 for di, day in enumerate(DAYS):
                     saved_val = self.data.availability.get(name, {}).get(day, "off")
-                    # Default fixed-schedule staff to "both", except their default off days
+                    # Default fixed-schedule staff availability
                     if staff.get("fixed_schedule") and saved_val == "off":
-                        default_off = staff.get("default_off", [])
-                        if day in default_off:
-                            saved_val = "off"
+                        # Check for per-day default_availability (managers)
+                        default_avail = staff.get("default_availability", {})
+                        if default_avail and day in default_avail:
+                            saved_val = default_avail[day]
                         else:
-                            saved_val = "both"
+                            # Check for default_off days (Diane/Leony)
+                            default_off = staff.get("default_off", [])
+                            if day in default_off:
+                                saved_val = "off"
+                            else:
+                                saved_val = "both"
                     var = tk.StringVar(value=saved_val)
                     self.avail_vars[name][day] = var
                     combo = ttk.Combobox(self.avail_frame, textvariable=var,
@@ -1384,6 +1430,17 @@ class ToyoSchedulerApp:
             row = add_section_header(row, "DUAL ROLE (Server/Host)")
             row = add_column_headers(row)
             row = add_staff_rows(row, dual)
+
+        # --- Managers section ---
+        managers = [s for s in active if "manager" in s["roles"]]
+        if managers:
+            managers.sort(key=lambda s: s["name"])
+            ttk.Separator(self.avail_frame, orient="horizontal").grid(
+                row=row, column=0, columnspan=9, sticky="ew", pady=8)
+            row += 1
+            row = add_section_header(row, "MANAGERS")
+            row = add_column_headers(row)
+            row = add_staff_rows(row, managers)
 
     def _set_all_available(self):
         for name, days in self.avail_vars.items():
