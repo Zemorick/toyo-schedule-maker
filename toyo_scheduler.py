@@ -111,7 +111,7 @@ DEFAULT_STAFF = [
      "active": True, "flags": [], "role_preference": "host"},
     {"name": "Olivia", "roles": ["host"], "seniority": 8, "fixed_schedule": False,
      "active": True, "flags": ["seniority_priority"], "role_preference": "host"},
-    {"name": "Lily", "roles": ["host"], "seniority": 4, "fixed_schedule": False,
+    {"name": "Lilly", "roles": ["host"], "seniority": 4, "fixed_schedule": False,
      "active": True, "flags": [], "role_preference": "host"},
     {"name": "Ashlyn", "roles": ["host"], "seniority": 4, "fixed_schedule": False,
      "active": True, "flags": [], "role_preference": "host"},
@@ -253,11 +253,13 @@ class ScheduleGenerator:
         }
         self.shift_counts = {}  # name -> total shifts
         self.hibachi_counts = {}  # name -> hibachi shifts this week
+        self.closing_counts = {}  # name -> closing host shifts this week
         self.warnings = []
 
     def generate(self):
         self.shift_counts = {}
         self.hibachi_counts = {}
+        self.closing_counts = {}
         self.warnings = []
         avail = self.data.availability
         config = self.data.config
@@ -408,16 +410,53 @@ class ScheduleGenerator:
                 self.schedule[day]["lunch_hosts"].append(h["name"])
                 self._add_shift(h["name"])
 
-            # Dinner hosts
+            # Dinner hosts — balance closing (last slot)
             needed = staffing["dinner_hosts"]
-            candidates = [h for h in hosts
-                          if self._can_work(h["name"], day, "night")
-                          and not self._is_assigned(h["name"], day)
-                          and not ("no_closing" in (self.data.get_staff_by_name(h["name"]) or {}).get("flags", []))]
-            candidates.sort(key=lambda h: (self._get_shift_count(h["name"]), -h["seniority"]))
-            for h in candidates[:needed - len(self.schedule[day]["dinner_hosts"])]:
-                self.schedule[day]["dinner_hosts"].append(h["name"])
-                self._add_shift(h["name"])
+            already = len(self.schedule[day]["dinner_hosts"])
+            slots_to_fill = needed - already
+            if slots_to_fill > 0:
+                # Candidates who can close (excludes no_closing flag)
+                can_close = [h for h in hosts
+                             if self._can_work(h["name"], day, "night")
+                             and not self._is_assigned(h["name"], day)
+                             and "no_closing" not in (self.data.get_staff_by_name(h["name"]) or {}).get("flags", [])]
+                # Candidates who can't close (Maria etc.) — only for non-closing slots
+                no_close = [h for h in hosts
+                            if self._can_work(h["name"], day, "night")
+                            and not self._is_assigned(h["name"], day)
+                            and "no_closing" in (self.data.get_staff_by_name(h["name"]) or {}).get("flags", [])]
+
+                # Sort non-closing by shift balance
+                no_close.sort(key=lambda h: (self._get_shift_count(h["name"]), -h["seniority"]))
+                # Sort closing candidates by shift balance
+                can_close.sort(key=lambda h: (self._get_shift_count(h["name"]), -h["seniority"]))
+
+                # Fill non-closing slots first (all but last), prefer no_close staff for these
+                non_closing_slots = slots_to_fill - 1
+                closing_slot = 1
+                assigned_names = set()
+
+                # Pick non-closing slot hosts from both pools (no_close first, then can_close)
+                non_closing_pool = no_close + can_close
+                for h in non_closing_pool:
+                    if non_closing_slots <= 0:
+                        break
+                    if h["name"] not in assigned_names:
+                        self.schedule[day]["dinner_hosts"].append(h["name"])
+                        self._add_shift(h["name"])
+                        assigned_names.add(h["name"])
+                        non_closing_slots -= 1
+
+                # Pick closing slot host — fewest closing counts
+                closing_candidates = [h for h in can_close if h["name"] not in assigned_names]
+                closing_candidates.sort(key=lambda h: (
+                    self.closing_counts.get(h["name"], 0),
+                    self._get_shift_count(h["name"]),
+                    -h["seniority"]))
+                for h in closing_candidates[:closing_slot]:
+                    self.schedule[day]["dinner_hosts"].append(h["name"])
+                    self._add_shift(h["name"])
+                    self.closing_counts[h["name"]] = self.closing_counts.get(h["name"], 0) + 1
 
         # Check if we need dual-role staff to fill host gaps
         for day in DAYS:
@@ -1290,30 +1329,18 @@ class ToyoSchedulerApp:
         frame = ttk.Frame(self.notebook)
         self.notebook.add(frame, text="  Configuration  ")
 
-        # Manager settings
-        mgr_frame = ttk.LabelFrame(frame, text="Managers")
-        mgr_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        ttk.Label(mgr_frame, text="Lunch Manager:").grid(row=0, column=0, padx=10, pady=5)
-        self.lunch_mgr_var = tk.StringVar(value=self.data.config["managers"]["lunch"])
-        ttk.Entry(mgr_frame, textvariable=self.lunch_mgr_var, width=15).grid(row=0, column=1, padx=5)
-
-        ttk.Label(mgr_frame, text="Dinner Manager:").grid(row=0, column=2, padx=10, pady=5)
-        self.dinner_mgr_var = tk.StringVar(value=self.data.config["managers"]["dinner"])
-        ttk.Entry(mgr_frame, textvariable=self.dinner_mgr_var, width=15).grid(row=0, column=3, padx=5)
-
         # Staffing grid
         grid_frame = ttk.LabelFrame(frame, text="Staffing Numbers Per Day")
         grid_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        labels = ["", "Lunch\nServers", "Lunch\nHosts", "Hibachi\nLunch", "Mid\nServers",
+        labels = ["", "Lunch\nServers", "Lunch\nHosts", "Hibachi\nLunch",
                   "Dinner\nServers", "Dinner\nHosts", "Hibachi\nDinner"]
         for i, label in enumerate(labels):
             ttk.Label(grid_frame, text=label, font=("Helvetica", 9, "bold"),
                      justify="center").grid(row=0, column=i, padx=8, pady=5)
 
         self.config_vars = {}
-        keys = ["lunch_servers", "lunch_hosts", "hibachi_lunch", "mid_servers",
+        keys = ["lunch_servers", "lunch_hosts", "hibachi_lunch",
                 "dinner_servers", "dinner_hosts", "hibachi_dinner"]
 
         for di, day in enumerate(DAYS):
@@ -1335,9 +1362,7 @@ class ToyoSchedulerApp:
         ttk.Button(btn_frame, text="Copy Weekday to All", command=self._copy_weekday).pack(side=tk.LEFT, padx=5)
 
     def _save_config(self):
-        self.data.config["managers"]["lunch"] = self.lunch_mgr_var.get()
-        self.data.config["managers"]["dinner"] = self.dinner_mgr_var.get()
-        keys = ["lunch_servers", "lunch_hosts", "hibachi_lunch", "mid_servers",
+        keys = ["lunch_servers", "lunch_hosts", "hibachi_lunch",
                 "dinner_servers", "dinner_hosts", "hibachi_dinner"]
         for day in DAYS:
             for key in keys:
@@ -1347,7 +1372,7 @@ class ToyoSchedulerApp:
 
     def _copy_weekday(self):
         """Copy Monday values to Tue-Thu"""
-        keys = ["lunch_servers", "lunch_hosts", "hibachi_lunch", "mid_servers",
+        keys = ["lunch_servers", "lunch_hosts", "hibachi_lunch",
                 "dinner_servers", "dinner_hosts", "hibachi_dinner"]
         for day in ["TUE", "WED", "THU"]:
             for key in keys:
@@ -1393,108 +1418,378 @@ class ToyoSchedulerApp:
         for widget in self.avail_frame.winfo_children():
             widget.destroy()
 
+        # Internal avail_vars still tracks name -> day -> StringVar("off"/"morning"/"night"/"both")
+        # for compatibility with save/load/photo import
         self.avail_vars = {}
-        options = ["off", "morning", "night", "both"]
-
         active = [s for s in self.data.staff if s["active"]]
 
-        # Split into servers, hosts, and managers
-        # Dual-role staff appear in both servers and hosts
-        servers = [s for s in active if "server" in s["roles"] and "manager" not in s["roles"]]
-        hosts = [s for s in active if "host" in s["roles"] and "manager" not in s["roles"]]
+        # Initialize avail_vars for all active non-manager staff
+        for staff in active:
+            if "manager" in staff["roles"]:
+                continue
+            name = staff["name"]
+            if name not in self.avail_vars:
+                self.avail_vars[name] = {}
+                for day in DAYS:
+                    saved_val = self.data.availability.get(name, {}).get(day, "off")
+                    if staff.get("fixed_schedule") and saved_val == "off":
+                        default_avail = staff.get("default_availability", {})
+                        if default_avail and day in default_avail:
+                            saved_val = default_avail[day]
+                        else:
+                            default_off = staff.get("default_off", [])
+                            saved_val = "off" if day in default_off else "both"
+                    self.avail_vars[name][day] = tk.StringVar(value=saved_val)
 
-        # Sort each group: fixed schedule first, then by name
-        for group in (servers, hosts):
-            group.sort(key=lambda s: (0 if s.get("fixed_schedule") else 1, s["name"]))
+        # Build name lists for dropdowns
+        servers = [s for s in active if "server" in s["roles"] and "manager" not in s["roles"]
+                   and "emergency_only" not in s.get("flags", [])]
+        hosts = [s for s in active if "host" in s["roles"] and "manager" not in s["roles"]
+                 and "emergency_only" not in s.get("flags", [])]
+        servers.sort(key=lambda s: s["name"])
+        hosts.sort(key=lambda s: s["name"])
+
+        def make_name_list(staff_list):
+            """Build dropdown options: plain names."""
+            names = [""]
+            for s in staff_list:
+                names.append(s["name"])
+            return names
+
+        server_names = make_name_list(servers)
+        host_names = make_name_list(hosts)
+
+        # Cell widgets and name lists: (role, shift, day) -> cell widget / name list
+        self._cell_widgets = {}
+        self._slot_names = {}
+
+        # Pre-populate slot_names from avail_vars
+        def find_display_name(real_name, name_list):
+            if real_name in name_list:
+                return real_name
+            return real_name
+
+        for role_key, staff_list, name_list in [
+            ("server", servers, server_names),
+            ("host", hosts, host_names),
+        ]:
+            for staff in staff_list:
+                name = staff["name"]
+                if name not in self.avail_vars:
+                    continue
+                display = find_display_name(name, name_list)
+                for day in DAYS:
+                    val = self.avail_vars[name][day].get()
+                    if val in ("morning", "both"):
+                        key = (role_key, "morning", day)
+                        if key not in self._slot_names:
+                            self._slot_names[key] = []
+                        if display not in self._slot_names[key]:
+                            self._slot_names[key].append(display)
+                    if val in ("night", "both"):
+                        key = (role_key, "night", day)
+                        if key not in self._slot_names:
+                            self._slot_names[key] = []
+                        if display not in self._slot_names[key]:
+                            self._slot_names[key].append(display)
+
+        def make_staff_cell(parent, names_list, full_name_list, role_key, shift, day, row, col):
+            """Cell with selected names (with X to remove) and a dropdown to add."""
+            cell = tk.Frame(parent, relief="groove", bd=1, bg="white", width=130)
+            cell.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
+            cell._names = names_list  # list of currently selected names
+            cell._full_list = full_name_list
+            cell._role_key = role_key
+            cell._shift = shift
+            cell._day = day
+
+            def extract_name(display_val):
+                if not display_val:
+                    return ""
+                return display_val
+
+            def sync_to_avail():
+                """Sync this cell's selections back to avail_vars."""
+                # This cell's names contribute to availability
+                for display in cell._names:
+                    real_name = extract_name(display)
+                    if real_name and real_name in self.avail_vars:
+                        current = self.avail_vars[real_name][day].get()
+                        if shift == "morning":
+                            if current in ("night", "both"):
+                                self.avail_vars[real_name][day].set("both")
+                            else:
+                                self.avail_vars[real_name][day].set("morning")
+                        else:
+                            if current in ("morning", "both"):
+                                self.avail_vars[real_name][day].set("both")
+                            else:
+                                self.avail_vars[real_name][day].set("night")
+
+            def refresh_cell():
+                # Clear cell contents
+                for w in cell.winfo_children():
+                    w.destroy()
+
+                # Show selected names with X buttons
+                for i, display_name in enumerate(cell._names):
+                    name_frame = tk.Frame(cell, bg="white")
+                    name_frame.pack(fill=tk.X, padx=2, pady=1)
+
+                    tk.Label(name_frame, text=display_name, font=("Helvetica", 8),
+                             bg="white", anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+                    def make_remove(idx):
+                        def remove(event=None):
+                            removed = cell._names.pop(idx)
+                            real_name = extract_name(removed)
+                            # Clear this shift from avail_vars, recalc from all cells
+                            if real_name in self.avail_vars:
+                                self.avail_vars[real_name][day].set("off")
+                                # Re-sync all cells for this name/day
+                                for key, c in self._cell_widgets.items():
+                                    rk, sh, d = key
+                                    if d == day:
+                                        for dn in c._names:
+                                            rn = extract_name(dn)
+                                            if rn == real_name:
+                                                cur = self.avail_vars[rn][d].get()
+                                                if sh == "morning":
+                                                    self.avail_vars[rn][d].set(
+                                                        "both" if cur == "night" else "morning")
+                                                else:
+                                                    self.avail_vars[rn][d].set(
+                                                        "both" if cur == "morning" else "night")
+                            refresh_cell()
+                        return remove
+
+                    x_btn = tk.Label(name_frame, text="x", font=("Helvetica", 8, "bold"),
+                                     fg="red", bg="white", cursor="hand2")
+                    x_btn.pack(side=tk.RIGHT, padx=2)
+                    x_btn.bind("<Button-1>", make_remove(i))
+
+                # Add dropdown button
+                add_frame = tk.Frame(cell, bg="white")
+                add_frame.pack(fill=tk.X, padx=2, pady=(2, 1))
+
+                add_btn = tk.Label(add_frame, text="+ Add", font=("Helvetica", 8),
+                                   fg="gray", bg="#f0f0f0", relief="raised", bd=1,
+                                   cursor="hand2")
+                add_btn.pack(fill=tk.X)
+
+                def open_popup(event=None):
+                    popup = tk.Toplevel(parent)
+                    popup.overrideredirect(True)
+                    popup.attributes("-topmost", True)
+
+                    x = add_btn.winfo_rootx()
+                    y = add_btn.winfo_rooty() + add_btn.winfo_height()
+                    popup.geometry(f"+{x}+{y}")
+
+                    lb_frame = tk.Frame(popup)
+                    lb_frame.pack(fill=tk.BOTH, expand=True)
+
+                    scrollbar = tk.Scrollbar(lb_frame)
+                    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+                    # Filter out already-selected names
+                    selected_real = {extract_name(n) for n in cell._names}
+                    available = [n for n in cell._full_list
+                                 if n and extract_name(n) not in selected_real]
+
+                    lb = tk.Listbox(lb_frame, width=18, height=min(12, max(len(available), 1)),
+                                    font=("Helvetica", 9), selectmode=tk.SINGLE,
+                                    yscrollcommand=scrollbar.set, activestyle="dotbox")
+                    lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                    scrollbar.config(command=lb.yview)
+
+                    for name in available:
+                        lb.insert(tk.END, name)
+
+                    def on_select(event=None):
+                        sel = lb.curselection()
+                        if sel:
+                            chosen = lb.get(sel[0])
+                            if chosen:
+                                cell._names.append(chosen)
+                                sync_to_avail()
+                                refresh_cell()
+                        popup.destroy()
+
+                    def on_key(event):
+                        ch = event.char
+                        if not ch or not ch.isalpha():
+                            if event.keysym == 'Return':
+                                on_select()
+                                return "break"
+                            if event.keysym == 'Escape':
+                                popup.destroy()
+                                return "break"
+                            return
+                        ch = ch.lower()
+                        for i in range(lb.size()):
+                            item = lb.get(i)
+                            if item and item.lower().startswith(ch):
+                                lb.see(i)
+                                lb.selection_clear(0, tk.END)
+                                lb.selection_set(i)
+                                lb.activate(i)
+                                return "break"
+                        return "break"
+
+                    def on_arrow(event):
+                        idx = lb.index(tk.ACTIVE)
+                        if event.keysym == 'Down' and idx < lb.size() - 1:
+                            idx += 1
+                        elif event.keysym == 'Up' and idx > 0:
+                            idx -= 1
+                        lb.selection_clear(0, tk.END)
+                        lb.selection_set(idx)
+                        lb.activate(idx)
+                        lb.see(idx)
+                        return "break"
+
+                    lb.bind("<ButtonRelease-1>", on_select)
+                    lb.bind("<Key>", on_key)
+                    lb.bind("<Down>", on_arrow)
+                    lb.bind("<Up>", on_arrow)
+                    popup.update_idletasks()
+                    lb.focus_force()
+                    def close_if_outside(event):
+                        try:
+                            w = event.widget
+                            if w != lb and w != popup and not str(w).startswith(str(popup)):
+                                popup.destroy()
+                        except tk.TclError:
+                            pass
+                    popup.bind("<FocusOut>", lambda e: popup.after(100, lambda: close_popup_safe(popup)))
+
+                    def close_popup_safe(p):
+                        try:
+                            if not p.focus_get() or not str(p.focus_get()).startswith(str(p)):
+                                p.destroy()
+                        except (tk.TclError, AttributeError):
+                            pass
+
+                add_btn.bind("<Button-1>", open_popup)
+
+            refresh_cell()
+            return cell
+
+        def add_section(row, title, name_list, role_key, staff_list):
+            # Section header
+            ttk.Label(self.avail_frame, text=title,
+                      font=("Helvetica", 12, "bold"), foreground="navy").grid(
+                row=row, column=0, columnspan=8, padx=5, pady=(10, 3), sticky="w")
+            row += 1
+
+            # Day column headers
+            ttk.Label(self.avail_frame, text="", width=10).grid(row=row, column=0)
+            for di, day in enumerate(DAYS):
+                ttk.Label(self.avail_frame, text=day, font=("Helvetica", 10, "bold"),
+                          width=16).grid(row=row, column=di + 1, padx=2, pady=3)
+            row += 1
+
+            # --- Morning ---
+            ttk.Label(self.avail_frame, text="Morning",
+                      font=("Helvetica", 10, "bold"), foreground="darkorange").grid(
+                row=row, column=0, padx=5, pady=(5, 2), sticky="nw")
+            for di, day in enumerate(DAYS):
+                key = (role_key, "morning", day)
+                names = self._slot_names.get(key, [])
+                cell = make_staff_cell(self.avail_frame, names, name_list,
+                                       role_key, "morning", day, row, di + 1)
+                self._cell_widgets[key] = cell
+                self._slot_names[key] = names
+            row += 1
+
+            # --- Night ---
+            ttk.Label(self.avail_frame, text="Night",
+                      font=("Helvetica", 10, "bold"), foreground="darkblue").grid(
+                row=row, column=0, padx=5, pady=(8, 2), sticky="nw")
+            for di, day in enumerate(DAYS):
+                key = (role_key, "night", day)
+                names = self._slot_names.get(key, [])
+                cell = make_staff_cell(self.avail_frame, names, name_list,
+                                       role_key, "night", day, row, di + 1)
+                self._cell_widgets[key] = cell
+                self._slot_names[key] = names
+            row += 1
+
+            return row
 
         row = 0
 
-        def add_section_header(row, title):
-            ttk.Label(self.avail_frame, text=title,
-                     font=("Helvetica", 11, "bold"), foreground="navy").grid(
-                row=row, column=0, columnspan=9, padx=5, pady=(10, 3), sticky="w")
-            return row + 1
-
-        def add_column_headers(row):
-            ttk.Label(self.avail_frame, text="Name", font=("Helvetica", 10, "bold"),
-                     width=15).grid(row=row, column=0, padx=5, pady=3)
-            for di, day in enumerate(DAYS):
-                ttk.Label(self.avail_frame, text=day, font=("Helvetica", 10, "bold"),
-                         width=10).grid(row=row, column=di + 2, padx=3, pady=3)
-            return row + 1
-
-        def add_staff_rows(row, staff_list):
-            for staff in staff_list:
-                name = staff["name"]
-                ttk.Label(self.avail_frame, text=name, width=15).grid(
-                    row=row, column=0, padx=5, pady=2, sticky="w")
-
-                # Create vars on first appearance, reuse on second
-                if name not in self.avail_vars:
-                    self.avail_vars[name] = {}
-                    for di, day in enumerate(DAYS):
-                        saved_val = self.data.availability.get(name, {}).get(day, "off")
-                        if staff.get("fixed_schedule") and saved_val == "off":
-                            default_avail = staff.get("default_availability", {})
-                            if default_avail and day in default_avail:
-                                saved_val = default_avail[day]
-                            else:
-                                default_off = staff.get("default_off", [])
-                                if day in default_off:
-                                    saved_val = "off"
-                                else:
-                                    saved_val = "both"
-                        self.avail_vars[name][day] = tk.StringVar(value=saved_val)
-
-                for di, day in enumerate(DAYS):
-                    var = self.avail_vars[name][day]
-                    combo = ttk.Combobox(self.avail_frame, textvariable=var,
-                                        values=options, state="readonly", width=8)
-                    combo.grid(row=row, column=di + 2, padx=3, pady=2)
-                row += 1
-            return row
-
         # --- Servers section ---
-        row = add_section_header(row, "SERVERS")
-        row = add_column_headers(row)
-        row = add_staff_rows(row, servers)
+        row = add_section(row, "SERVERS", server_names, "server", servers)
 
-        # --- Separator ---
         ttk.Separator(self.avail_frame, orient="horizontal").grid(
-            row=row, column=0, columnspan=9, sticky="ew", pady=8)
+            row=row, column=0, columnspan=8, sticky="ew", pady=8)
         row += 1
 
         # --- Hosts section ---
-        row = add_section_header(row, "HOSTS")
-        row = add_column_headers(row)
-        row = add_staff_rows(row, hosts)
-
-        # --- Managers section ---
-        managers = [s for s in active if "manager" in s["roles"]]
-        if managers:
-            managers.sort(key=lambda s: s["name"])
-            ttk.Separator(self.avail_frame, orient="horizontal").grid(
-                row=row, column=0, columnspan=9, sticky="ew", pady=8)
-            row += 1
-            row = add_section_header(row, "MANAGERS")
-            row = add_column_headers(row)
-            row = add_staff_rows(row, managers)
+        row = add_section(row, "HOSTS", host_names, "host", hosts)
 
     def _set_all_available(self):
-        for name, days in self.avail_vars.items():
-            for day, var in days.items():
-                var.set("both")
+        for staff in self.data.staff:
+            if not staff["active"] or "manager" in staff["roles"]:
+                continue
+            name = staff["name"]
+            for day in DAYS:
+                self.data.availability.setdefault(name, {})[day] = "both"
+        self._build_availability_grid()
 
     def _clear_availability(self):
-        for name, days in self.avail_vars.items():
-            staff = self.data.get_staff_by_name(name)
-            for day, var in days.items():
-                if staff and staff.get("fixed_schedule"):
-                    var.set("both")
-                else:
-                    var.set("off")
+        for staff in self.data.staff:
+            if not staff["active"] or "manager" in staff["roles"]:
+                continue
+            name = staff["name"]
+            if staff.get("fixed_schedule"):
+                default_avail = staff.get("default_availability", {})
+                for day in DAYS:
+                    if default_avail and day in default_avail:
+                        self.data.availability.setdefault(name, {})[day] = default_avail[day]
+                    else:
+                        default_off = staff.get("default_off", [])
+                        self.data.availability.setdefault(name, {})[day] = "off" if day in default_off else "both"
+            else:
+                for day in DAYS:
+                    self.data.availability.setdefault(name, {})[day] = "off"
+        self._build_availability_grid()
 
     def _save_availability(self):
+        # Full sync from cell widgets to avail_vars
+        if hasattr(self, '_cell_widgets'):
+            def extract_name(display_val):
+                if not display_val:
+                    return ""
+                return display_val
+
+            # Reset all non-fixed to off
+            for name, days in self.avail_vars.items():
+                staff = self.data.get_staff_by_name(name)
+                if staff and staff.get("fixed_schedule"):
+                    continue
+                for day in DAYS:
+                    days[day].set("off")
+
+            # Rebuild from cells
+            for (role_key, shift, day), cell in self._cell_widgets.items():
+                for display in cell._names:
+                    real_name = extract_name(display)
+                    if real_name and real_name in self.avail_vars:
+                        current = self.avail_vars[real_name][day].get()
+                        if shift == "morning":
+                            if current in ("night", "both"):
+                                self.avail_vars[real_name][day].set("both")
+                            else:
+                                self.avail_vars[real_name][day].set("morning")
+                        else:
+                            if current in ("morning", "both"):
+                                self.avail_vars[real_name][day].set("both")
+                            else:
+                                self.avail_vars[real_name][day].set("night")
+
         avail = {}
         for name, days in self.avail_vars.items():
             avail[name] = {}
@@ -1524,7 +1819,7 @@ class ToyoSchedulerApp:
         progress_win.update()
 
         try:
-            detected = self._run_ocr(filepath)
+            detected, raw_ocr_texts = self._run_ocr(filepath)
         except Exception as e:
             progress_win.destroy()
             messagebox.showerror("OCR Error", f"Failed to read image:\n{e}")
@@ -1538,15 +1833,92 @@ class ToyoSchedulerApp:
                                    "Try a clearer photo or enter availability manually.")
             return
 
-        self._show_ocr_confirmation(detected)
+        self._show_ocr_confirmation(detected, raw_ocr_texts)
 
     # Nickname / handwriting alias map: alias -> canonical staff name
     NAME_ALIASES = {
-        "mak": "Makayla", "makayla": "Makayla",
-        "kam": "Kamryn", "kamryn": "Kamryn",
+        # Makayla
+        "mak": "Makayla", "makayla": "Makayla", "mok": "Makayla",
+        "makaila": "Makayla", "makayia": "Makayla",
+        # Kamryn
+        "kam": "Kamryn", "kamryn": "Kamryn", "kamrin": "Kamryn",
+        "kamrya": "Kamryn", "kamryu": "Kamryn",
+        # Dian
         "dran": "Dian", "dlan": "Dian", "diane": "Dian",
+        "dion": "Dian", "dran": "Dian", "diau": "Dian",
+        "dcam": "Dian", "dcan": "Dian",
+        # Catie Grey
         "catie grace": "Catie Grey", "catie gray": "Catie Grey",
         "catiegrace": "Catie Grey", "catiegray": "Catie Grey",
+        "catie grey": "Catie Grey", "catiegrey": "Catie Grey",
+        "catie gvey": "Catie Grey", "catie guey": "Catie Grey",
+        # Abigail
+        "abigail": "Abigail", "abigai": "Abigail", "abigal": "Abigail",
+        "abiguito": "Abigail", "abiguit": "Abigail", "abigui": "Abigail",
+        "abiquii": "Abigail", "abiqui": "Abigail", "abiquito": "Abigail",
+        "abiga": "Abigail", "abigu": "Abigail", "abigi": "Abigail",
+        "abig": "Abigail", "abiqail": "Abigail", "abigoll": "Abigail",
+        "abigaie": "Abigail", "abigaif": "Abigail",
+        # Q
+        "q": "Q", "q ": "Q",
+        # Lilly
+        "lilly": "Lilly", "lily": "Lilly", "lily": "Lilly",
+        "lilli": "Lilly", "liily": "Lilly", "lllly": "Lilly",
+        # Olivia
+        "olivia": "Olivia", "olivio": "Olivia", "oivia": "Olivia",
+        "oiivia": "Olivia",
+        # Ashlyn
+        "ashlyn": "Ashlyn", "ashlya": "Ashlyn", "ashiyn": "Ashlyn",
+        "ashlyu": "Ashlyn", "ashlyh": "Ashlyn", "ashuyn": "Ashlyn",
+        # Addison
+        "addison": "Addison", "addisoh": "Addison", "addisoa": "Addison",
+        "addisor": "Addison", "addisoo": "Addison", "addisca": "Addison",
+        "addiscn": "Addison",
+        # Hannah
+        "hannah": "Hannah", "hannoh": "Hannah", "hannak": "Hannah",
+        # Maria
+        "maria": "Maria", "mario": "Maria", "marig": "Maria",
+        # Leony
+        "leony": "Leony", "leonv": "Leony", "leonu": "Leony",
+        "leouy": "Leony", "leong": "Leony",
+        # Maddie
+        "maddie": "Maddie", "maddi": "Maddie", "maddre": "Maddie",
+        "maddle": "Maddie", "moddre": "Maddie", "moddie": "Maddie",
+        # Owen
+        "owen": "Owen", "owen": "Owen", "oweu": "Owen", "owev": "Owen",
+        # Sadie
+        "sadie": "Sadie", "sadle": "Sadie", "sodic": "Sadie",
+        "sodie": "Sadie",
+        # Arabella
+        "arabella": "Arabella", "arabela": "Arabella", "arobella": "Arabella",
+        "arabello": "Arabella", "arahella": "Arabella", "arabela": "Arabella",
+        "arabeila": "Arabella", "arabdla": "Arabella", "aradella": "Arabella",
+        # Kat
+        "kat": "Kat", "kot": "Kat", "kaf": "Kat",
+        # Trish
+        "trish": "Trish", "trisk": "Trish", "tish": "Trish",
+        # Sam
+        "sam": "Sam", "som": "Sam", "scm": "Sam",
+        # Garret
+        "garret": "Garret", "garrel": "Garret", "garref": "Garret",
+        "garrett": "Garret", "garrct": "Garret", "gavret": "Garret",
+        # Collin
+        "collin": "Collin", "collih": "Collin", "collir": "Collin",
+        "collia": "Collin", "colln": "Collin", "collia": "Collin",
+        # Bryan
+        "bryan": "Bryan", "bryah": "Bryan", "bryau": "Bryan",
+        "bryon": "Bryan", "bryar": "Bryan", "boyar": "Bryan",
+        # Jazz
+        "jazz": "Jazz", "jozz": "Jazz", "jass": "Jazz", "jaz": "Jazz",
+        # Will
+        "will": "Will", "wili": "Will", "wiil": "Will",
+        # Andy
+        "andy": "Andy", "audy": "Andy", "andv": "Andy", "ady": "Andy",
+        # Winnie
+        "winnie": "Winnie", "winnle": "Winnie", "wlnnie": "Winnie",
+        "wianie": "Winnie", "wirmie": "Winnie",
+        # Ross
+        "ross": "Ross",
     }
 
     # Row labels that indicate morning (lunch) shifts
@@ -1554,7 +1926,8 @@ class ToyoSchedulerApp:
                             "host 1", "host 2", "10:30", "10:15", "2:15", "2:30"]
     # Row labels that indicate night (dinner) shifts
     NIGHT_ROW_KEYWORDS = ["hostess 3", "dinner server", "dinner buser", "buser",
-                          "host 3", "4:30", "4:00", "6:00", "close", "8:30"]
+                          "host 3", "3a", "3b", "hostess 3a", "hostess 3b",
+                          "4:30", "4:00", "6:00", "close", "8:30"]
 
     def _get_ocr_reader(self):
         """Load EasyOCR reader once, cache on instance."""
@@ -1642,8 +2015,10 @@ class ToyoSchedulerApp:
             cell_gray = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
             cell_gray = clahe.apply(cell_gray)
-            # Upscale 2x for better text detection
-            cell_up = cv2.resize(cell_gray, None, fx=2, fy=2,
+            # Otsu binarization for cleaner black-on-white text
+            _, cell_gray = cv2.threshold(cell_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # Upscale 3x for better text detection (especially handwriting)
+            cell_up = cv2.resize(cell_gray, None, fx=3, fy=3,
                                  interpolation=cv2.INTER_CUBIC)
             import tempfile
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
@@ -1651,6 +2026,9 @@ class ToyoSchedulerApp:
             return tmp.name
 
         # --- Fuzzy match helpers ---
+        # Single-char staff names need special handling
+        single_char_names = {n.lower(): n for n in known_names if len(n) == 1}
+
         def fuzzy_match_name(text):
             text_clean = text.strip().lower()
             for ch in "✓✔☑▪•|[]{}()_~#@!$%^&*+=<>\"'/\\.,;:":
@@ -1659,6 +2037,17 @@ class ToyoSchedulerApp:
             text_clean = text_clean.strip("0123456789 ")
             if len(text_clean) < 1:
                 return None
+
+            # Check for single-character names (like "Q") anywhere in text
+            if single_char_names:
+                # Exact single char match
+                if text_clean in single_char_names:
+                    return single_char_names[text_clean]
+                # Single char surrounded by spaces or at word boundaries
+                for ch, name in single_char_names.items():
+                    words = text_clean.split()
+                    if ch in words:
+                        return name
 
             # Exact alias
             if text_clean in self.NAME_ALIASES:
@@ -1672,6 +2061,8 @@ class ToyoSchedulerApp:
             best_name = None
             best_score = 0.0
             for name in known_names:
+                if len(name) == 1:
+                    continue  # Already handled above
                 nl = name.lower()
                 score = SequenceMatcher(None, text_clean, nl).ratio()
                 if nl in text_clean or text_clean in nl:
@@ -1682,7 +2073,7 @@ class ToyoSchedulerApp:
                     best_score = score
                     best_name = name
 
-            threshold = 0.7 if len(text_clean) <= 3 else 0.5
+            threshold = 0.7 if len(text_clean) <= 3 else 0.45
             return best_name if best_score >= threshold else None
 
         day_keywords = {
@@ -1757,6 +2148,7 @@ class ToyoSchedulerApp:
 
         # --- Step 3: OCR each data cell ---
         detected_names = {}  # name -> {day -> set of shifts}
+        raw_ocr_texts = {}   # name -> set of raw OCR strings that matched
 
         for ri in range(len(h_positions) - 1):
             ry1, ry2 = h_positions[ri], h_positions[ri + 1]
@@ -1779,21 +2171,40 @@ class ToyoSchedulerApp:
                     tmp_path, text_threshold=0.15, low_text=0.15, width_ths=0.3)
                 os.unlink(tmp_path)
 
-                for _, text, _ in results:
+                for _, text, conf in results:
                     if not text or len(text.strip()) < 1:
                         continue
-                    # Handle "Name & Name" or "Name Name" patterns
+                    # Split on common separators: &, "and", newlines, slashes
                     parts = [text]
-                    for sep in [" & ", " and ", "&"]:
-                        if sep in text:
-                            parts = [p.strip() for p in text.split(sep) if p.strip()]
-                            break
+                    for sep in ["\n", " & ", " and ", "&", "/"]:
+                        new_parts = []
+                        for p in parts:
+                            new_parts.extend([s.strip() for s in p.split(sep) if s.strip()])
+                        parts = new_parts
+
+                    # Also try splitting long text that may contain multiple names
+                    # e.g., "Leony Dian" -> ["Leony", "Dian"]
+                    expanded = []
+                    for part in parts:
+                        expanded.append(part)
+                        # If no direct match, try splitting on spaces
+                        if not fuzzy_match_name(part) and " " in part:
+                            words = part.split()
+                            # Try each word individually
+                            expanded.extend(words)
+                            # Try consecutive word pairs
+                            for i in range(len(words) - 1):
+                                expanded.append(words[i] + " " + words[i + 1])
+                    parts = expanded
 
                     for part in parts:
                         name = fuzzy_match_name(part)
                         if name:
                             if name not in detected_names:
                                 detected_names[name] = {}
+                            if name not in raw_ocr_texts:
+                                raw_ocr_texts[name] = set()
+                            raw_ocr_texts[name].add(part.strip())
                             shift = row_shift or "both"
                             if day not in detected_names[name]:
                                 detected_names[name][day] = set()
@@ -1821,12 +2232,13 @@ class ToyoSchedulerApp:
                         avail[day] = "off"
                 result[name] = avail
 
-        return result
+        return result, raw_ocr_texts
 
     def _run_ocr_fallback(self, filepath, reader, known_names):
         """Fallback OCR when grid detection fails — run on full image."""
         results = reader.readtext(filepath, text_threshold=0.2, low_text=0.2)
         detected_names = {}
+        raw_ocr_texts = {}
         for _, text, _ in results:
             text_clean = text.strip().lower()
             for ch in "✓✔☑▪•|[]{}()_~#@!$%^&*+=<>\"'/\\.,;:":
@@ -1847,107 +2259,364 @@ class ToyoSchedulerApp:
                         best_score = score
                         best_name = n
                 name = best_name if best_score >= 0.6 else None
-            if name and name not in detected_names:
-                detected_names[name] = set(DAYS)
+            if name:
+                if name not in detected_names:
+                    detected_names[name] = set(DAYS)
+                if name not in raw_ocr_texts:
+                    raw_ocr_texts[name] = set()
+                raw_ocr_texts[name].add(text.strip())
 
         result = {}
         for name in known_names:
             if name in detected_names:
                 result[name] = {day: "both" for day in DAYS}
-        return result
+        return result, raw_ocr_texts
 
-    def _show_ocr_confirmation(self, detected):
-        """Show a dialog for the manager to review and confirm OCR results."""
+    def _show_ocr_confirmation(self, detected, raw_ocr_texts=None):
+        """Show a dialog for the manager to review and confirm OCR results — cell-based layout."""
+        if raw_ocr_texts is None:
+            raw_ocr_texts = {}
         dialog = tk.Toplevel(self.root)
         dialog.title("Confirm Sign-Up Sheet")
-        dialog.geometry("900x600")
+        dialog.geometry("1100x650")
         dialog.transient(self.root)
         dialog.grab_set()
 
         ttk.Label(dialog, text="Review detected availability from photo",
                   font=("Helvetica", 12, "bold")).pack(pady=(10, 3))
-        ttk.Label(dialog, text="Adjust any incorrect entries, then click Apply.",
+        ttk.Label(dialog, text="Add/remove names in each cell, then click Apply.",
                   font=("Helvetica", 10)).pack(pady=(0, 8))
 
         # Scrollable frame
         canvas = tk.Canvas(dialog)
         v_scroll = ttk.Scrollbar(dialog, orient=tk.VERTICAL, command=canvas.yview)
+        h_scroll = ttk.Scrollbar(dialog, orient=tk.HORIZONTAL, command=canvas.xview)
         inner = ttk.Frame(canvas)
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=v_scroll.set)
+        canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
         v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Mousewheel
         canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
         canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
 
-        options = ["off", "morning", "night", "both"]
-        ocr_vars = {}  # name -> {day: StringVar}
-
-        # Header
-        ttk.Label(inner, text="Name", font=("Helvetica", 10, "bold"),
-                  width=15).grid(row=0, column=0, padx=5, pady=3)
-        ttk.Label(inner, text="Detected?", font=("Helvetica", 10, "bold"),
-                  width=10).grid(row=0, column=1, padx=3, pady=3)
-        for di, day in enumerate(DAYS):
-            ttk.Label(inner, text=day, font=("Helvetica", 10, "bold"),
-                      width=10).grid(row=0, column=di + 2, padx=3, pady=3)
-
-        # Build rows for all active non-manager staff
+        # Build staff groups
         active = [s for s in self.data.staff if s["active"]
                   and "manager" not in s["roles"]
                   and "emergency_only" not in s.get("flags", [])]
-        active.sort(key=lambda s: s["name"])
+        servers = [s for s in active if "server" in s["roles"]]
+        hosts = [s for s in active if "host" in s["roles"]]
+        servers.sort(key=lambda s: s["name"])
+        hosts.sort(key=lambda s: s["name"])
 
-        for ri, staff in enumerate(active):
-            name = staff["name"]
-            row = ri + 1
-            was_detected = name in detected
+        def make_name_list(staff_list):
+            names = []
+            for s in staff_list:
+                names.append(s["name"])
+            return names
 
-            # Name label - highlight if detected
-            lbl = ttk.Label(inner, text=name, width=15)
-            if was_detected:
-                lbl.configure(foreground="green")
-            else:
-                lbl.configure(foreground="gray")
-            lbl.grid(row=row, column=0, padx=5, pady=2, sticky="w")
+        server_names = make_name_list(servers)
+        host_names = make_name_list(hosts)
 
-            # Detection status
-            status = "Yes" if was_detected else "No"
-            s_lbl = ttk.Label(inner, text=status, width=10,
-                              foreground="green" if was_detected else "gray")
-            s_lbl.grid(row=row, column=1, padx=3, pady=2)
+        def extract_name(display_val):
+            if not display_val:
+                return ""
+            parts = display_val.rsplit(" ", 1)
+            if len(parts) == 2 and parts[1] in ("server", "host", "dual"):
+                return parts[0]
+            return display_val
 
-            ocr_vars[name] = {}
+        def find_display(real_name, name_list):
+            for n in name_list:
+                if extract_name(n) == real_name:
+                    return n
+            return real_name
+
+        # Build cell data from detected results
+        # ocr_cells: (role, shift, day) -> [display_name, ...]
+        ocr_cells = {}
+        ocr_cell_widgets = {}
+
+        for role_key, staff_list, name_list in [("server", servers, server_names),
+                                                 ("host", hosts, host_names)]:
+            for staff in staff_list:
+                name = staff["name"]
+                display = find_display(name, name_list)
+                # Fixed schedule staff use their set schedule
+                if staff.get("fixed_schedule"):
+                    default_avail = staff.get("default_availability", {})
+                    default_off = staff.get("default_off", [])
+                    for day in DAYS:
+                        if default_avail and day in default_avail:
+                            val = default_avail[day]
+                        else:
+                            val = "off" if day in default_off else "both"
+                        if val in ("morning", "both"):
+                            key = (role_key, "morning", day)
+                            ocr_cells.setdefault(key, [])
+                            if display not in ocr_cells[key]:
+                                ocr_cells[key].append(display)
+                        if val in ("night", "both"):
+                            key = (role_key, "night", day)
+                            ocr_cells.setdefault(key, [])
+                            if display not in ocr_cells[key]:
+                                ocr_cells[key].append(display)
+                elif name in detected:
+                    for day in DAYS:
+                        val = detected[name].get(day, "off")
+                        if val in ("morning", "both"):
+                            key = (role_key, "morning", day)
+                            ocr_cells.setdefault(key, [])
+                            if display not in ocr_cells[key]:
+                                ocr_cells[key].append(display)
+                        if val in ("night", "both"):
+                            key = (role_key, "night", day)
+                            ocr_cells.setdefault(key, [])
+                            if display not in ocr_cells[key]:
+                                ocr_cells[key].append(display)
+
+        def make_ocr_cell(parent, names_list, full_name_list, row, col):
+            """Cell with detected names (X to remove) and + Add dropdown."""
+            cell = tk.Frame(parent, relief="groove", bd=1, bg="white", width=130)
+            cell.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
+            cell._names = names_list
+            cell._full_list = full_name_list
+
+            def refresh():
+                for w in cell.winfo_children():
+                    w.destroy()
+                for i, display_name in enumerate(cell._names):
+                    nf = tk.Frame(cell, bg="white")
+                    nf.pack(fill=tk.X, padx=2, pady=1)
+                    real = extract_name(display_name)
+                    # Green if detected, blue if fixed schedule
+                    color = "green" if real in detected else "blue"
+                    tk.Label(nf, text=display_name, font=("Helvetica", 8),
+                             bg="white", fg=color, anchor="w").pack(
+                        side=tk.LEFT, fill=tk.X, expand=True)
+                    def make_remove(idx):
+                        def remove(event=None):
+                            cell._names.pop(idx)
+                            refresh()
+                        return remove
+                    x_btn = tk.Label(nf, text="x", font=("Helvetica", 8, "bold"),
+                                     fg="red", bg="white", cursor="hand2")
+                    x_btn.pack(side=tk.RIGHT, padx=2)
+                    x_btn.bind("<Button-1>", make_remove(i))
+
+                # Raw OCR info
+                detected_in_cell = [extract_name(n) for n in cell._names if extract_name(n) in raw_ocr_texts]
+                if detected_in_cell:
+                    raw_texts = []
+                    for n in detected_in_cell:
+                        raw_texts.extend(raw_ocr_texts[n])
+                    raw_str = ", ".join(sorted(set(raw_texts)))
+                    if raw_str:
+                        tk.Label(cell, text=f"OCR: {raw_str}", font=("Helvetica", 7),
+                                 fg="gray", bg="white", wraplength=120, anchor="w").pack(
+                            fill=tk.X, padx=2)
+
+                # Add button
+                add_frame = tk.Frame(cell, bg="white")
+                add_frame.pack(fill=tk.X, padx=2, pady=(2, 1))
+                add_btn = tk.Label(add_frame, text="+ Add", font=("Helvetica", 8),
+                                   fg="gray", bg="#f0f0f0", relief="raised", bd=1,
+                                   cursor="hand2")
+                add_btn.pack(fill=tk.X)
+
+                def open_popup(event=None):
+                    popup = tk.Toplevel(parent)
+                    popup.overrideredirect(True)
+                    popup.attributes("-topmost", True)
+                    x = add_btn.winfo_rootx()
+                    y = add_btn.winfo_rooty() + add_btn.winfo_height()
+                    popup.geometry(f"+{x}+{y}")
+
+                    selected_real = {extract_name(n) for n in cell._names}
+                    available = [n for n in cell._full_list if n and extract_name(n) not in selected_real]
+
+                    lb_frame = tk.Frame(popup)
+                    lb_frame.pack(fill=tk.BOTH, expand=True)
+                    scrollbar = tk.Scrollbar(lb_frame)
+                    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+                    lb = tk.Listbox(lb_frame, width=18, height=min(12, max(len(available), 1)),
+                                    font=("Helvetica", 9), selectmode=tk.SINGLE,
+                                    yscrollcommand=scrollbar.set, activestyle="dotbox")
+                    lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                    scrollbar.config(command=lb.yview)
+                    for name in available:
+                        lb.insert(tk.END, name)
+
+                    def on_select(event=None):
+                        sel = lb.curselection()
+                        if sel:
+                            chosen = lb.get(sel[0])
+                            if chosen:
+                                cell._names.append(chosen)
+                                refresh()
+                        popup.destroy()
+
+                    def on_key(event):
+                        ch = event.char
+                        if not ch or not ch.isalpha():
+                            if event.keysym == 'Return':
+                                on_select()
+                                return "break"
+                            if event.keysym == 'Escape':
+                                popup.destroy()
+                                return "break"
+                            return
+                        ch = ch.lower()
+                        for i in range(lb.size()):
+                            item = lb.get(i)
+                            if item and item.lower().startswith(ch):
+                                lb.see(i)
+                                lb.selection_clear(0, tk.END)
+                                lb.selection_set(i)
+                                lb.activate(i)
+                                return "break"
+                        return "break"
+
+                    def on_arrow(event):
+                        idx = lb.index(tk.ACTIVE)
+                        if event.keysym == 'Down' and idx < lb.size() - 1:
+                            idx += 1
+                        elif event.keysym == 'Up' and idx > 0:
+                            idx -= 1
+                        lb.selection_clear(0, tk.END)
+                        lb.selection_set(idx)
+                        lb.activate(idx)
+                        lb.see(idx)
+                        return "break"
+
+                    lb.bind("<ButtonRelease-1>", on_select)
+                    lb.bind("<Key>", on_key)
+                    lb.bind("<Down>", on_arrow)
+                    lb.bind("<Up>", on_arrow)
+                    popup.update_idletasks()
+                    lb.focus_force()
+                    def close_if_outside(event):
+                        try:
+                            w = event.widget
+                            if w != lb and w != popup and not str(w).startswith(str(popup)):
+                                popup.destroy()
+                        except tk.TclError:
+                            pass
+                    popup.bind("<FocusOut>", lambda e: popup.after(100, lambda: close_popup_safe(popup)))
+
+                    def close_popup_safe(p):
+                        try:
+                            if not p.focus_get() or not str(p.focus_get()).startswith(str(p)):
+                                p.destroy()
+                        except (tk.TclError, AttributeError):
+                            pass
+
+                add_btn.bind("<Button-1>", open_popup)
+
+            refresh()
+            return cell
+
+        def add_section(row, title, name_list, role_key):
+            ttk.Label(inner, text=title,
+                      font=("Helvetica", 12, "bold"), foreground="navy").grid(
+                row=row, column=0, columnspan=8, padx=5, pady=(10, 3), sticky="w")
+            row += 1
+
+            ttk.Label(inner, text="", width=10).grid(row=row, column=0)
             for di, day in enumerate(DAYS):
-                if was_detected:
-                    val = detected[name].get(day, "off")
-                else:
-                    val = "off"
-                var = tk.StringVar(value=val)
-                ocr_vars[name][day] = var
-                combo = ttk.Combobox(inner, textvariable=var, values=options,
-                                     state="readonly", width=8)
-                combo.grid(row=row, column=di + 2, padx=3, pady=2)
+                ttk.Label(inner, text=day, font=("Helvetica", 10, "bold"),
+                          width=16).grid(row=row, column=di + 1, padx=2, pady=3)
+            row += 1
 
-        # Buttons at the bottom
+            # Morning
+            ttk.Label(inner, text="Morning",
+                      font=("Helvetica", 10, "bold"), foreground="darkorange").grid(
+                row=row, column=0, padx=5, pady=(5, 2), sticky="nw")
+            for di, day in enumerate(DAYS):
+                key = (role_key, "morning", day)
+                names = ocr_cells.get(key, [])
+                cell = make_ocr_cell(inner, names, name_list, row, di + 1)
+                ocr_cell_widgets[key] = cell
+            row += 1
+
+            # Night
+            ttk.Label(inner, text="Night",
+                      font=("Helvetica", 10, "bold"), foreground="darkblue").grid(
+                row=row, column=0, padx=5, pady=(8, 2), sticky="nw")
+            for di, day in enumerate(DAYS):
+                key = (role_key, "night", day)
+                names = ocr_cells.get(key, [])
+                cell = make_ocr_cell(inner, names, name_list, row, di + 1)
+                ocr_cell_widgets[key] = cell
+            row += 1
+
+            return row
+
+        row = 0
+        row = add_section(row, "SERVERS", server_names, "server")
+        ttk.Separator(inner, orient="horizontal").grid(
+            row=row, column=0, columnspan=8, sticky="ew", pady=8)
+        row += 1
+        row = add_section(row, "HOSTS", host_names, "host")
+
+        # Buttons
         btn_frame = ttk.Frame(dialog)
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
 
         def apply_ocr():
-            for name, days in ocr_vars.items():
-                if name in self.avail_vars:
-                    for day, var in days.items():
-                        self.avail_vars[name][day].set(var.get())
+            # Build availability from cell contents
+            for name in [s["name"] for s in active]:
+                staff = self.data.get_staff_by_name(name)
+                if staff and staff.get("fixed_schedule"):
+                    continue
+                self.data.availability.setdefault(name, {})
+                for day in DAYS:
+                    self.data.availability[name][day] = "off"
+
+            for (role_key, shift, day), cell in ocr_cell_widgets.items():
+                for display in cell._names:
+                    real_name = extract_name(display)
+                    if not real_name:
+                        continue
+                    self.data.availability.setdefault(real_name, {})
+                    current = self.data.availability[real_name].get(day, "off")
+                    if shift == "morning":
+                        if current in ("night", "both"):
+                            self.data.availability[real_name][day] = "both"
+                        else:
+                            self.data.availability[real_name][day] = "morning"
+                    else:
+                        if current in ("morning", "both"):
+                            self.data.availability[real_name][day] = "both"
+                        else:
+                            self.data.availability[real_name][day] = "night"
+
             dialog.destroy()
+            self._build_availability_grid()
             messagebox.showinfo("Applied",
                                 "Availability updated from photo.\n"
                                 "Click 'Save Availability' to save.")
 
+        def reset_to_detected():
+            # Rebuild ocr_cells from detected data and refresh all cells
+            for (role_key, shift, day), cell in ocr_cell_widgets.items():
+                key = (role_key, shift, day)
+                original = ocr_cells.get(key, [])
+                cell._names.clear()
+                cell._names.extend(original)
+                # Refresh cell display
+                for w in cell.winfo_children():
+                    w.destroy()
+                # Trigger refresh by re-calling make_ocr_cell logic
+            # Easier: just rebuild the whole dialog content
+            dialog.destroy()
+            self._show_ocr_confirmation(detected, raw_ocr_texts)
+
         ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="Apply", command=apply_ocr).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="Reset to Detected", command=reset_to_detected).pack(side=tk.LEFT, padx=5)
 
     # ---- TAB 4: SCHEDULE GENERATION ----
     def _build_schedule_tab(self):
@@ -2017,13 +2686,12 @@ class ToyoSchedulerApp:
 
     def _save_config_silent(self):
         if hasattr(self, 'config_vars'):
-            self.data.config["managers"]["lunch"] = self.lunch_mgr_var.get()
-            self.data.config["managers"]["dinner"] = self.dinner_mgr_var.get()
-            keys = ["lunch_servers", "lunch_hosts", "hibachi_lunch", "mid_servers",
+            keys = ["lunch_servers", "lunch_hosts", "hibachi_lunch",
                     "dinner_servers", "dinner_hosts", "hibachi_dinner"]
             for day in DAYS:
                 for key in keys:
-                    self.data.config["staffing"][day][key] = self.config_vars[day][key].get()
+                    if key in self.config_vars[day]:
+                        self.data.config["staffing"][day][key] = self.config_vars[day][key].get()
             self.data.config["week_start"] = self.week_start_var.get()
             self.data.save_config()
 
@@ -2189,13 +2857,48 @@ class ToyoSchedulerApp:
             ttk.Label(self.sched_inner, text=f"{name}: {count} shifts",
                      font=("Helvetica", 8)).grid(row=r, column=c, padx=5, sticky="w")
 
+    def _get_available_for_slot(self, day, key):
+        """Build list of available staff for a schedule slot, with role labels for dual-role."""
+        shift_type = "morning" if "lunch" in key else "night"
+        slot_role = "server" if "server" in key else "host"
+
+        avail = self.data.availability
+        options = []
+
+        for s in self.data.staff:
+            if not s["active"] or "manager" in s["roles"]:
+                continue
+            if "emergency_only" in s.get("flags", []):
+                continue
+            name = s["name"]
+
+            # Check availability for this day/shift
+            staff_avail = avail.get(name, {}).get(day, "off")
+            if staff_avail == "off":
+                continue
+            if shift_type == "morning" and staff_avail == "night":
+                continue
+            if shift_type == "night" and staff_avail == "morning":
+                continue
+
+            # Check role match and label dual-role staff
+            is_dual = "server" in s["roles"] and "host" in s["roles"]
+            has_role = slot_role in s["roles"]
+
+            if has_role and is_dual:
+                options.append((name, name))
+            elif has_role:
+                options.append((name, name))
+
+        options.sort(key=lambda x: x[1].lower())
+        return options
+
     def _edit_cell(self, day, key, index):
-        """Let manager swap a staff member in a cell"""
+        """Let manager swap a staff member in a cell via searchable dropdown."""
         if not self.current_schedule:
             return
 
         if key == "dinner_servers":
-            # Combined list
             hibachi = self.current_schedule[day]["hibachi_servers"]
             servers = self.current_schedule[day]["dinner_servers"]
             combined = hibachi + servers
@@ -2208,33 +2911,51 @@ class ToyoSchedulerApp:
                 return
             current_name = lst[index]
 
-        # Show popup to select replacement
+        # Get available staff for this slot
+        available = self._get_available_for_slot(day, key)
+        display_names = ["(remove)"] + [label for _, label in available]
+        name_map = {"(remove)": "(remove)"}
+        for real_name, label in available:
+            name_map[label] = real_name
+
         dlg = tk.Toplevel(self.root)
-        dlg.title(f"Edit {day} - {key}")
-        dlg.geometry("300x400")
+        dlg.title(f"Edit {day} - {key.replace('_', ' ').title()}")
+        dlg.geometry("350x150")
         dlg.transient(self.root)
         dlg.grab_set()
 
         ttk.Label(dlg, text=f"Current: {current_name}",
-                 font=("Helvetica", 11, "bold")).pack(pady=10)
-        ttk.Label(dlg, text="Select replacement:").pack()
+                 font=("Helvetica", 11, "bold")).pack(pady=(15, 5))
+        ttk.Label(dlg, text="Type to search, then select:").pack()
 
-        listbox = tk.Listbox(dlg, width=30, height=15)
-        listbox.pack(padx=10, pady=5, fill=tk.BOTH, expand=True)
+        combo_var = tk.StringVar()
+        combo = ttk.Combobox(dlg, textvariable=combo_var, values=display_names,
+                             width=35, font=("Helvetica", 10))
+        combo.pack(padx=15, pady=10)
+        combo.focus_set()
 
-        # Get eligible staff
-        role = "server" if "server" in key else "host"
-        eligible = [s["name"] for s in self.data.get_active_staff(role)]
-        eligible.append("(remove)")
-        for name in sorted(eligible):
-            listbox.insert(tk.END, name)
+        # Filter dropdown as user types
+        def on_keyrelease(event):
+            if event.keysym in ('Return', 'Tab', 'Escape', 'Up', 'Down', 'Left', 'Right'):
+                return
+            typed = combo_var.get().lower()
+            if not typed:
+                combo["values"] = display_names
+                return
+            filtered = [n for n in display_names if n.lower().startswith(typed)]
+            if not filtered:
+                filtered = [n for n in display_names if typed in n.lower()]
+            combo["values"] = filtered if filtered else display_names
 
-        def apply():
-            sel = listbox.curselection()
-            if not sel:
+        combo.bind("<KeyRelease>", on_keyrelease)
+        combo.bind("<FocusIn>", lambda e: combo.configure(values=display_names))
+
+        def apply(event=None):
+            selection = combo_var.get()
+            if not selection:
                 dlg.destroy()
                 return
-            new_name = listbox.get(sel[0])
+            new_name = name_map.get(selection, selection)
 
             if key == "dinner_servers":
                 hibachi = self.current_schedule[day]["hibachi_servers"]
@@ -2260,7 +2981,8 @@ class ToyoSchedulerApp:
             self._display_schedule()
             dlg.destroy()
 
-        ttk.Button(dlg, text="Apply", command=apply).pack(pady=10)
+        combo.bind("<<ComboboxSelected>>", apply)
+        ttk.Button(dlg, text="Apply", command=apply).pack(pady=5)
 
     def _select_midshifts(self):
         """Open dialog for manager to pick midshift servers"""
