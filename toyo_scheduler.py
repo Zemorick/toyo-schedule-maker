@@ -46,6 +46,16 @@ MORNING_EXTRA_ORDER = ["C", "A", "B"]  # doubles in this order
 NIGHT_SIDEWORK = ["A", "B", "C", "D", "E", "F", "G", "H"]
 NIGHT_EXTRA_ORDER = ["F", "H", "G", "E", "D", "C", "B", "A"]  # doubles in this order
 
+# Hibachi shift targets per week. Most servers should hit 2; senior staff
+# (Andy, Dian, Leony) max out at 1 hibachi/week so they stay on regular sidework.
+HIBACHI_TARGET_DEFAULT = 2
+HIBACHI_TARGET_SENIOR = 1
+HIBACHI_SENIOR_NAMES = {"Andy", "Dian", "Leony"}
+
+
+def hibachi_target(name):
+    return HIBACHI_TARGET_SENIOR if name in HIBACHI_SENIOR_NAMES else HIBACHI_TARGET_DEFAULT
+
 LUNCH_SERVER_TIME = "(10:15-2:15)"
 LUNCH_HOST_TIMES = ["(10:15-4:15)", "(10:15-2:15)"]
 LUNCH_MANAGER_TIME = "(10:15-4:15) "
@@ -281,6 +291,8 @@ class ScheduleGenerator:
                 "dinner_manager": "",
                 "hibachi_lunch_servers": [],
                 "hibachi_servers": [],
+                "b_side_lunch": [],
+                "b_side_dinner": [],
             }
             for day in DAYS
         }
@@ -702,7 +714,11 @@ class ScheduleGenerator:
 
         for day in DAYS:
             # --- Morning servers get A-D ---
-            servers = list(self.schedule[day]["lunch_servers"])
+            # B-side staff are excluded from the A-side letter pool entirely so
+            # the remaining A,B,C,D... letters compact without gaps. They get
+            # their own W/X/Y assignment further down.
+            b_lunch_set = set(self.schedule[day].get("b_side_lunch", []))
+            servers = [n for n in self.schedule[day]["lunch_servers"] if n not in b_lunch_set]
             hibachi_lunch = list(self.schedule[day]["hibachi_lunch_servers"])
 
             self.schedule[day]["lunch_server_letters"] = {}
@@ -733,8 +749,15 @@ class ScheduleGenerator:
             for i, name in enumerate(hibachi_lunch):
                 self.schedule[day]["lunch_server_letters"][name] = hibachi_pool[i % len(hibachi_pool)]
 
+            # B-side (sushi side) overrides letters with W, X, Y in insertion order
+            b_side_pool = ["W", "X", "Y"]
+            for i, name in enumerate(self.schedule[day].get("b_side_lunch", [])):
+                self.schedule[day]["lunch_server_letters"][name] = b_side_pool[i] if i < len(b_side_pool) else b_side_pool[-1]
+
             # --- Night servers get A-H ---
-            dinner_regular = list(self.schedule[day]["dinner_servers"])
+            # B-side staff excluded from the A-side pool so A,B,C... compacts without gaps.
+            b_dinner_set = set(self.schedule[day].get("b_side_dinner", []))
+            dinner_regular = [n for n in self.schedule[day]["dinner_servers"] if n not in b_dinner_set]
             dinner_hibachi = list(self.schedule[day]["hibachi_servers"])
 
             self.schedule[day]["dinner_server_letters"] = {}
@@ -760,6 +783,11 @@ class ScheduleGenerator:
             hibachi_pool = ["F", "H", "G", "E"]  # dinner hibachi letters — cycle through
             for i, name in enumerate(dinner_hibachi):
                 self.schedule[day]["dinner_server_letters"][name] = hibachi_pool[i % len(hibachi_pool)]
+
+            # B-side (sushi side) overrides letters with W, X, Y in insertion order
+            b_side_pool = ["W", "X", "Y"]
+            for i, name in enumerate(self.schedule[day].get("b_side_dinner", [])):
+                self.schedule[day]["dinner_server_letters"][name] = b_side_pool[i] if i < len(b_side_pool) else b_side_pool[-1]
 
 
     def _balance_hibachi(self, config):
@@ -946,17 +974,25 @@ class ExcelExporter:
             servers = self.schedule[day]["lunch_servers"]
             letters = self.schedule[day].get("lunch_server_letters", {})
             mids = self.schedule[day].get("mid_servers", [])
+            b_set = set(self.schedule[day].get("b_side_lunch", []))
 
-            # Sort: regular by letter first, then hibachi by letter
+            # Sort: B-side on top, then regular A,B,C..., then hibachi (within letter)
             hib_set = set(hibachi_lunch)
             combined = list(servers) + list(hibachi_lunch)
-            combined.sort(key=lambda n: (letters.get(n, "Z"), 1 if n in hib_set else 0))
+            combined.sort(key=lambda n: (
+                0 if n in b_set else 1,
+                letters.get(n, "Z"),
+                1 if n in hib_set else 0,
+            ))
 
             row = 3
             for name in combined:
                 letter = letters.get(name, chr(65 + row - 3))
                 mid_mark = "*" if name in mids else ""
-                ws[f"{col}{row}"] = f"{name} {letter}{mid_mark}"
+                if name in b_set:
+                    ws[f"{col}{row}"] = f"<{name} {letter}>{mid_mark}"
+                else:
+                    ws[f"{col}{row}"] = f"{name} {letter}{mid_mark}"
                 ws[f"{col}{row}"].font = staff_font(name)
                 ws[f"{col}{row}"].alignment = Alignment(horizontal="center")
                 if name in hib_set:
@@ -1030,17 +1066,25 @@ class ExcelExporter:
             hibachi = self.schedule[day]["hibachi_servers"]
             letters = self.schedule[day].get("dinner_server_letters", {})
             mids = self.schedule[day].get("mid_servers", [])
+            b_set = set(self.schedule[day].get("b_side_dinner", []))
 
-            # Sort: regular by letter first, then hibachi by letter
+            # Sort: B-side on top, then regular A,B,C..., then hibachi (within letter)
             hib_set = set(hibachi)
             combined = list(servers) + list(hibachi)
-            combined.sort(key=lambda n: (letters.get(n, "Z"), 1 if n in hib_set else 0))
+            combined.sort(key=lambda n: (
+                0 if n in b_set else 1,
+                letters.get(n, "Z"),
+                1 if n in hib_set else 0,
+            ))
 
             row = 21
             for name in combined:
                 letter = letters.get(name, chr(65 + row - 21))
                 mid_mark = "*" if name in mids else ""
-                ws[f"{col}{row}"] = f"{name} {letter}{mid_mark}"
+                if name in b_set:
+                    ws[f"{col}{row}"] = f"<{name} {letter}>{mid_mark}"
+                else:
+                    ws[f"{col}{row}"] = f"{name} {letter}{mid_mark}"
                 ws[f"{col}{row}"].font = staff_font(name)
                 ws[f"{col}{row}"].alignment = Alignment(horizontal="center")
                 if name in hib_set:
@@ -1167,11 +1211,11 @@ class ExcelExporter:
             ws[f"{col}37"].border = section_top
             ws[f"{col}38"].border = thin_border
 
-            # Dinner manager (rows 39-40): section top and bottom
+            # Dinner manager (rows 39-40): section top on 39, section bottom on 40
             ws[f"{col}39"].border = Border(
                 left=Side(style="thin"), right=Side(style="thin"),
                 top=Side(style="medium"), bottom=Side(style="medium"))
-            ws[f"{col}40"].border = thin_border
+            ws[f"{col}40"].border = section_bottom
 
         wb.save(filepath)
         return filepath
@@ -1235,15 +1279,23 @@ class PDFExporter:
                 hibachi_lunch = self.schedule[day]["hibachi_lunch_servers"]
                 servers = self.schedule[day]["lunch_servers"]
                 letters = self.schedule[day].get("lunch_server_letters", {})
+                b_set = set(self.schedule[day].get("b_side_lunch", []))
                 hib_set = set(hibachi_lunch)
                 combined = servers + hibachi_lunch
-                combined.sort(key=lambda n: (letters.get(n, "Z"), 1 if n in hib_set else 0))
+                combined.sort(key=lambda n: (
+                    0 if n in b_set else 1,
+                    letters.get(n, "Z"),
+                    1 if n in hib_set else 0,
+                ))
                 mids = self.schedule[day].get("mid_servers", [])
                 if si < len(combined):
                     name = combined[si]
                     letter = letters.get(name, chr(65 + si))
                     mid = "*" if name in mids else ""
-                    row.append(f"{name} {letter}{mid}")
+                    if name in b_set:
+                        row.append(f"<{name} {letter}>{mid}")
+                    else:
+                        row.append(f"{name} {letter}{mid}")
                 else:
                     row.append("")
             y = draw_row(y, row, size=6)
@@ -1302,15 +1354,23 @@ class PDFExporter:
                 hibachi = self.schedule[day]["hibachi_servers"]
                 servers = self.schedule[day]["dinner_servers"]
                 letters = self.schedule[day].get("dinner_server_letters", {})
+                b_set = set(self.schedule[day].get("b_side_dinner", []))
                 hib_set = set(hibachi)
                 combined = servers + hibachi
-                combined.sort(key=lambda n: (letters.get(n, "Z"), 1 if n in hib_set else 0))
+                combined.sort(key=lambda n: (
+                    0 if n in b_set else 1,
+                    letters.get(n, "Z"),
+                    1 if n in hib_set else 0,
+                ))
                 mids = self.schedule[day].get("mid_servers", [])
                 if si < len(combined):
                     name = combined[si]
                     letter = letters.get(name, chr(65 + si))
                     mid = "*" if name in mids else ""
-                    row.append(f"{name} {letter}{mid}")
+                    if name in b_set:
+                        row.append(f"<{name} {letter}>{mid}")
+                    else:
+                        row.append(f"{name} {letter}{mid}")
                 else:
                     row.append("")
             y = draw_row(y, row, size=6)
@@ -1357,7 +1417,7 @@ class PDFExporter:
         y += 3
         pdf.set_font("Helvetica", "I", 7)
         pdf.set_xy(x_start, y)
-        pdf.cell(0, 4, "* = Midshift server(s)  |  Gold = Hibachi side  |  Letters = Sidework assignment")
+        pdf.cell(0, 4, "* = Midshift server(s)  |  Gold = Hibachi side  |  W/X/Y = B-side (sushi)  |  Letters = Sidework assignment")
 
         pdf.output(filepath)
         return filepath
@@ -1378,19 +1438,38 @@ class ToyoSchedulerApp:
         self.current_schedule = None
         self.current_warnings = []
 
+        # Tracks the single currently-open +Add popup on the Availability tab
+        # so we can enforce one-at-a-time and toggle on repeat clicks.
+        self._active_add_popup = None
+        self._active_add_btn = None
+
         style = ttk.Style()
-        style.configure("TNotebook.Tab", padding=[12, 6], font=("Helvetica", 10))
-        style.configure("Treeview", rowheight=24, font=("Helvetica", 9))
-        style.configure("Treeview.Heading", font=("Helvetica", 10, "bold"))
+        style.configure("TNotebook.Tab", padding=[14, 8], font=("Helvetica", 11))
+        style.configure("Treeview", rowheight=32, font=("Helvetica", 12))
+        style.configure("Treeview.Heading", font=("Helvetica", 13, "bold"))
+        # Reusable larger button style for the main tab toolbars
+        style.configure("Big.TButton", font=("Helvetica", 12))
 
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # Close any open +Add popup when the user switches tabs
+        self.notebook.bind("<<NotebookTabChanged>>", self._close_active_add_popup)
 
         self._build_staff_tab()
         self._build_config_tab()
         self._build_availability_tab()
         self._build_schedule_tab()
         self._build_export_tab()
+
+    def _close_active_add_popup(self, event=None):
+        """Destroy the currently-open +Add popup, if any. Called on tab switch."""
+        if self._active_add_popup is not None:
+            try:
+                self._active_add_popup.destroy()
+            except tk.TclError:
+                pass
+            self._active_add_popup = None
+            self._active_add_btn = None
 
     # ---- TAB 1: STAFF MANAGEMENT ----
     def _build_staff_tab(self):
@@ -1399,21 +1478,32 @@ class ToyoSchedulerApp:
 
         # Toolbar
         toolbar = ttk.Frame(frame)
-        toolbar.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(toolbar, text="Add Staff", command=self._add_staff).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Edit Selected", command=self._edit_staff).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Remove Selected", command=self._remove_staff).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Reset to Defaults", command=self._reset_staff).pack(side=tk.RIGHT, padx=2)
+        toolbar.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Button(toolbar, text="Add Staff", command=self._add_staff,
+                   style="Big.TButton").pack(side=tk.LEFT, padx=3, ipadx=6, ipady=3)
+        ttk.Button(toolbar, text="Edit Selected", command=self._edit_staff,
+                   style="Big.TButton").pack(side=tk.LEFT, padx=3, ipadx=6, ipady=3)
+        ttk.Button(toolbar, text="Remove Selected", command=self._remove_staff,
+                   style="Big.TButton").pack(side=tk.LEFT, padx=3, ipadx=6, ipady=3)
+        ttk.Button(toolbar, text="Reset to Defaults", command=self._reset_staff,
+                   style="Big.TButton").pack(side=tk.RIGHT, padx=3, ipadx=6, ipady=3)
+        tk.Button(toolbar, text="❓  Flags Help",
+                  font=("Helvetica", 11, "bold"),
+                  bg="#FFD54F", fg="black", activebackground="#FFC107",
+                  relief="raised", bd=2, cursor="hand2",
+                  command=lambda: self._show_flags_help(self.root)).pack(
+            side=tk.RIGHT, padx=8, ipadx=6, ipady=3)
 
         # Treeview
         cols = ("Name", "Roles", "Seniority", "Preference", "Flags", "Active")
-        self.staff_tree = ttk.Treeview(frame, columns=cols, show="headings", height=20)
+        self.staff_tree = ttk.Treeview(frame, columns=cols, show="headings", height=18)
+        col_widths = {
+            "Name": 160, "Roles": 130, "Seniority": 110,
+            "Preference": 130, "Flags": 240, "Active": 90,
+        }
         for col in cols:
             self.staff_tree.heading(col, text=col)
-            w = 80 if col != "Name" else 120
-            if col == "Flags":
-                w = 180
-            self.staff_tree.column(col, width=w, anchor="center")
+            self.staff_tree.column(col, width=col_widths[col], anchor="center")
 
         scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.staff_tree.yview)
         self.staff_tree.configure(yscrollcommand=scrollbar.set)
@@ -1465,10 +1555,59 @@ class ToyoSchedulerApp:
             self.data.save_staff()
             self._refresh_staff_tree()
 
+    def _show_flags_help(self, parent):
+        """Popup explaining what each staff flag does."""
+        flags_doc = [
+            ("fixed_schedule",
+             "Staff member has a preset weekly schedule that overrides normal "
+             "availability. Used for managers (Aaron, Chan) and fixed-shift "
+             "servers like Dian and Leony."),
+            ("always_hibachi",
+             "This server is always assigned to hibachi shifts when working. "
+             "Used for Will."),
+            ("no_closing",
+             "Staff member cannot work the closing host shift. Used for "
+             "people who must leave early (e.g. Maria)."),
+            ("fill_in",
+             "Not used in the primary scheduling pass, but the generator will "
+             "pull them in as a backup if there aren't enough regular servers "
+             "to cover a shift."),
+            ("emergency_only",
+             "Never auto-scheduled, even as a backup. Only assignable "
+             "manually through the schedule edit dropdown. Used for staff "
+             "like Winnie, Ross, and Shayne."),
+            ("seniority_priority",
+             "Staff member gets priority shift assignments based on their "
+             "seniority score. Used for Olivia (host)."),
+        ]
+
+        win = tk.Toplevel(parent)
+        win.title("Staff Flags — What They Do")
+        win.geometry("520x400")
+        win.transient(parent)
+        win.grab_set()
+
+        ttk.Label(win, text="Staff Flags",
+                  font=("Helvetica", 14, "bold")).pack(pady=(12, 4))
+
+        body = tk.Frame(win, bg="white", bd=1, relief="sunken")
+        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+
+        for name, desc in flags_doc:
+            row = tk.Frame(body, bg="white")
+            row.pack(fill=tk.X, padx=10, pady=6, anchor="w")
+            tk.Label(row, text=name, font=("Helvetica", 11, "bold"),
+                     fg="#0066CC", bg="white", anchor="w").pack(anchor="w")
+            tk.Label(row, text=desc, font=("Helvetica", 10),
+                     bg="white", anchor="w", justify="left",
+                     wraplength=470).pack(anchor="w", padx=(12, 0))
+
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=10, ipadx=10)
+
     def _staff_dialog(self, existing):
         dlg = tk.Toplevel(self.root)
         dlg.title("Edit Staff" if existing else "Add Staff")
-        dlg.geometry("400x450")
+        dlg.geometry("460x540")
         dlg.transient(self.root)
         dlg.grab_set()
 
@@ -1500,8 +1639,18 @@ class ToyoSchedulerApp:
 
         row += 1
         ttk.Label(dlg, text="Flags:").grid(row=row, column=0, padx=10, pady=5, sticky="nw")
+        help_btn = tk.Button(
+            dlg, text="❓  What do these flags mean?",
+            font=("Helvetica", 10, "bold"),
+            bg="#FFD54F", fg="black", activebackground="#FFC107",
+            relief="raised", bd=2, cursor="hand2",
+            command=lambda: self._show_flags_help(dlg))
+        help_btn.grid(row=row, column=1, padx=10, pady=(5, 2),
+                      sticky="w", ipadx=8, ipady=4)
+
+        row += 1
         flags_frame = ttk.Frame(dlg)
-        flags_frame.grid(row=row, column=1, padx=10, pady=5, sticky="w")
+        flags_frame.grid(row=row, column=1, padx=10, pady=(2, 5), sticky="w")
         existing_flags = existing.get("flags", []) if existing else []
         flag_vars = {}
         for flag in ["fixed_schedule", "always_hibachi", "no_closing",
@@ -1574,52 +1723,138 @@ class ToyoSchedulerApp:
         frame = ttk.Frame(self.notebook)
         self.notebook.add(frame, text="  Configuration  ")
 
-        # Staffing grid
-        grid_frame = ttk.LabelFrame(frame, text="Staffing Numbers Per Day")
-        grid_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        # Staffing grid — days on the X axis, role/shift categories on the Y axis.
+        # Servers + hibachi rows go on top (frequently edited); hosts go at the
+        # bottom (rarely edited). Lunch rows are orange, dinner rows are blue —
+        # matching the Availability tab color coding. The grid expands with the
+        # window: starts at a comfortable midsize and uses extra space when the
+        # window is enlarged.
+        style = ttk.Style()
+        style.configure("Config.TLabelframe.Label",
+                        font=("Helvetica", 13, "bold"))
+        style.configure("Config.TButton", font=("Helvetica", 12))
 
-        labels = ["", "Lunch\nServers", "Lunch\nHosts", "Hibachi\nLunch",
-                  "Dinner\nServers", "Dinner\nHosts", "Hibachi\nDinner"]
-        for i, label in enumerate(labels):
-            ttk.Label(grid_frame, text=label, font=("Helvetica", 9, "bold"),
-                     justify="center").grid(row=0, column=i, padx=8, pady=5)
+        wrapper = ttk.Frame(frame)
+        wrapper.pack(fill=tk.BOTH, expand=True, padx=20, pady=15)
+        grid_frame = ttk.LabelFrame(wrapper, text="Staffing Numbers Per Day",
+                                    padding=12, style="Config.TLabelframe")
+        grid_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.config_vars = {}
-        keys = ["lunch_servers", "lunch_hosts", "hibachi_lunch",
-                "dinner_servers", "dinner_hosts", "hibachi_dinner"]
+        LUNCH_COLOR = "darkorange"
+        DINNER_COLOR = "darkblue"
 
+        # (key, label, color) — order on screen, top to bottom
+        rows = [
+            ("lunch_servers",  "Lunch Servers",  LUNCH_COLOR),
+            ("hibachi_lunch",  "Hibachi Lunch",  LUNCH_COLOR),
+            ("dinner_servers", "Dinner Servers", DINNER_COLOR),
+            ("hibachi_dinner", "Hibachi Dinner", DINNER_COLOR),
+            # --- separator row goes here ---
+            ("lunch_hosts",    "Lunch Hosts",    LUNCH_COLOR),
+            ("dinner_hosts",   "Dinner Hosts",   DINNER_COLOR),
+        ]
+        SEP_AFTER_INDEX = 4  # insert visual separator after the 4th data row
+
+        header_font = ("Helvetica", 14, "bold")
+        row_label_font = ("Helvetica", 13, "bold")
+        spinbox_font = ("Helvetica", 15)
+        cell_padx = 12
+        cell_pady = 9
+
+        # Top-left empty corner
+        ttk.Label(grid_frame, text="", width=16).grid(
+            row=0, column=0, padx=cell_padx, pady=cell_pady, sticky="nsew")
+        # Day column headers across the top (X axis)
         for di, day in enumerate(DAYS):
-            ttk.Label(grid_frame, text=day, font=("Helvetica", 10, "bold")).grid(
-                row=di + 1, column=0, padx=10, pady=3)
-            self.config_vars[day] = {}
-            for ki, key in enumerate(keys):
+            ttk.Label(grid_frame, text=day, font=header_font,
+                      anchor="center").grid(
+                row=0, column=di + 1, padx=cell_padx, pady=cell_pady, sticky="nsew")
+
+        # Equal-width day columns that grow with the window
+        for di in range(len(DAYS)):
+            grid_frame.columnconfigure(di + 1, weight=1, uniform="day", minsize=72)
+
+        self.config_vars = {day: {} for day in DAYS}
+
+        # Live-sync helper: any spinbox change immediately writes through to
+        # self.data.config so the schedule generator picks up new values
+        # without needing the user to click Save Configuration first.
+        def make_live_sync(d, k, v):
+            def sync(*_args):
+                try:
+                    self.data.config["staffing"][d][k] = int(v.get())
+                except (tk.TclError, ValueError):
+                    pass  # transient bad value while user is typing
+            return sync
+
+        # Place rows (with a separator inserted between servers/hibachi and hosts)
+        grid_row = 1
+        data_row_indices = []
+        for ri, (key, label, color) in enumerate(rows):
+            if ri == SEP_AFTER_INDEX:
+                ttk.Separator(grid_frame, orient="horizontal").grid(
+                    row=grid_row, column=0, columnspan=len(DAYS) + 1,
+                    sticky="ew", pady=6)
+                grid_row += 1
+
+            tk.Label(grid_frame, text=label, font=row_label_font,
+                     fg=color, anchor="w").grid(
+                row=grid_row, column=0, padx=cell_padx, pady=cell_pady, sticky="w")
+            for di, day in enumerate(DAYS):
                 val = self.data.config["staffing"][day].get(key, 0)
                 var = tk.IntVar(value=val)
                 self.config_vars[day][key] = var
-                sb = ttk.Spinbox(grid_frame, from_=0, to=15, textvariable=var,
-                                width=4, justify="center")
-                sb.grid(row=di + 1, column=ki + 1, padx=8, pady=3)
+                var.trace_add("write", make_live_sync(day, key, var))
+                sb = tk.Spinbox(grid_frame, from_=0, to=15, textvariable=var,
+                                width=5, justify="center", font=spinbox_font)
+                sb.grid(row=grid_row, column=di + 1,
+                        padx=cell_padx, pady=cell_pady)
+            data_row_indices.append(grid_row)
+            grid_row += 1
 
-        # Save button
+        # Make data rows share extra vertical space when the window grows
+        for r in data_row_indices:
+            grid_frame.rowconfigure(r, weight=1)
+
+        # Save / Revert buttons
         btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill=tk.X, padx=10, pady=10)
-        ttk.Button(btn_frame, text="Save Configuration", command=self._save_config).pack(side=tk.RIGHT)
-        ttk.Button(btn_frame, text="Copy Weekday to All", command=self._copy_weekday).pack(side=tk.LEFT, padx=5)
+        btn_frame.pack(fill=tk.X, padx=15, pady=10)
+        ttk.Button(btn_frame, text="Save Configuration",
+                   command=self._save_config,
+                   style="Config.TButton").pack(side=tk.RIGHT, padx=4, ipadx=8, ipady=4)
+        ttk.Button(btn_frame, text="Revert",
+                   command=self._revert_config,
+                   style="Config.TButton").pack(side=tk.RIGHT, padx=4, ipadx=8, ipady=4)
+        ttk.Button(btn_frame, text="Copy Weekday to All",
+                   command=self._copy_weekday,
+                   style="Config.TButton").pack(side=tk.LEFT, padx=5, ipadx=8, ipady=4)
 
     def _save_config(self):
-        keys = ["lunch_servers", "lunch_hosts", "hibachi_lunch",
-                "dinner_servers", "dinner_hosts", "hibachi_dinner"]
-        for day in DAYS:
-            for key in keys:
-                self.data.config["staffing"][day][key] = self.config_vars[day][key].get()
+        # Spinbox values live-sync into self.data.config via trace_add, so the
+        # in-memory state is always current. Save Configuration just persists
+        # that state to disk for future sessions.
         self.data.save_config()
         messagebox.showinfo("Saved", "Configuration saved!")
 
+    def _revert_config(self):
+        if not messagebox.askyesno(
+                "Revert Configuration",
+                "Are you sure you want to revert the configuration to the last "
+                "saved version? Any unsaved changes will be lost."):
+            return
+        # Reload from disk and push the values back into the spinbox vars.
+        # The trace on each var will update self.data.config to the same value.
+        self.data.config = self.data._load_config()
+        for day in DAYS:
+            for key, var in self.config_vars[day].items():
+                var.set(self.data.config["staffing"][day].get(key, 0))
+
     def _copy_weekday(self):
-        """Copy Monday values to Tue-Thu"""
+        """Copy Monday values to Tue-Wed only. Thursday is treated as part of
+        the busy weekend block (Thu-Sun) and is left untouched."""
         keys = ["lunch_servers", "lunch_hosts", "hibachi_lunch",
                 "dinner_servers", "dinner_hosts", "hibachi_dinner"]
-        for day in ["TUE", "WED", "THU"]:
+        for day in ["TUE", "WED"]:
             for key in keys:
                 self.config_vars[day][key].set(self.config_vars["MON"][key].get())
 
@@ -1630,12 +1865,18 @@ class ToyoSchedulerApp:
 
         # Toolbar
         toolbar = ttk.Frame(frame)
-        toolbar.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(toolbar, text="Set All Available", command=self._set_all_available).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Clear All", command=self._clear_availability).pack(side=tk.LEFT, padx=2)
+        toolbar.pack(fill=tk.X, padx=8, pady=8)
+        ttk.Button(toolbar, text="Set All Available", command=self._set_all_available,
+                   style="Big.TButton").pack(side=tk.LEFT, padx=3, ipadx=6, ipady=3)
+        ttk.Button(toolbar, text="Clear All", command=self._clear_availability,
+                   style="Big.TButton").pack(side=tk.LEFT, padx=3, ipadx=6, ipady=3)
         if HAS_OCR:
-            ttk.Button(toolbar, text="Import from Photo", command=self._import_from_photo).pack(side=tk.LEFT, padx=8)
-        ttk.Button(toolbar, text="Save Availability", command=self._save_availability).pack(side=tk.RIGHT, padx=2)
+            ttk.Button(toolbar, text="Import from Photo", command=self._import_from_photo,
+                       style="Big.TButton").pack(side=tk.LEFT, padx=10, ipadx=6, ipady=3)
+        ttk.Button(toolbar, text="Save Availability", command=self._save_availability,
+                   style="Big.TButton").pack(side=tk.RIGHT, padx=3, ipadx=6, ipady=3)
+        ttk.Button(toolbar, text="Revert", command=self._revert_availability,
+                   style="Big.TButton").pack(side=tk.RIGHT, padx=3, ipadx=6, ipady=3)
 
         # Scrollable grid
         canvas = tk.Canvas(frame)
@@ -1684,7 +1925,18 @@ class ToyoSchedulerApp:
                         else:
                             default_off = staff.get("default_off", [])
                             saved_val = "off" if day in default_off else "both"
-                    self.avail_vars[name][day] = tk.StringVar(value=saved_val)
+                    var = tk.StringVar(value=saved_val)
+                    self.avail_vars[name][day] = var
+                    # Live-sync this StringVar into self.data.availability so the
+                    # generator picks up cell edits without needing Save Availability.
+                    def make_live_sync(n=name, d=day, v=var):
+                        def sync(*_args):
+                            self.data.availability.setdefault(n, {})[d] = v.get()
+                        return sync
+                    var.trace_add("write", make_live_sync())
+                    # Also seed the value into self.data.availability now in case
+                    # this is the first time the staff member appears (no entry yet).
+                    self.data.availability.setdefault(name, {})[day] = saved_val
 
         # Build name lists for dropdowns (include emergency/fill-in for manual assignment)
         servers = [s for s in active if "server" in s["roles"] and "manager" not in s["roles"]]
@@ -1742,8 +1994,8 @@ class ToyoSchedulerApp:
 
         def make_staff_cell(parent, names_list, full_name_list, role_key, shift, day, row, col):
             """Cell with selected names (with X to remove) and a dropdown to add."""
-            cell = tk.Frame(parent, relief="groove", bd=1, bg="white", width=130)
-            cell.grid(row=row, column=col, padx=2, pady=2, sticky="nsew")
+            cell = tk.Frame(parent, relief="groove", bd=1, bg="white", width=160)
+            cell.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
             cell._names = names_list  # list of currently selected names
             cell._full_list = full_name_list
             cell._role_key = role_key
@@ -1781,9 +2033,9 @@ class ToyoSchedulerApp:
                 # Show selected names with X buttons
                 for i, display_name in enumerate(cell._names):
                     name_frame = tk.Frame(cell, bg="white")
-                    name_frame.pack(fill=tk.X, padx=2, pady=1)
+                    name_frame.pack(fill=tk.X, padx=3, pady=2)
 
-                    tk.Label(name_frame, text=display_name, font=("Helvetica", 8),
+                    tk.Label(name_frame, text=display_name, font=("Helvetica", 11),
                              bg="white", anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
 
                     def make_remove(idx):
@@ -1810,21 +2062,33 @@ class ToyoSchedulerApp:
                             refresh_cell()
                         return remove
 
-                    x_btn = tk.Label(name_frame, text="x", font=("Helvetica", 8, "bold"),
+                    x_btn = tk.Label(name_frame, text="x", font=("Helvetica", 11, "bold"),
                                      fg="red", bg="white", cursor="hand2")
-                    x_btn.pack(side=tk.RIGHT, padx=2)
+                    x_btn.pack(side=tk.RIGHT, padx=3)
                     x_btn.bind("<Button-1>", make_remove(i))
 
                 # Add dropdown button
                 add_frame = tk.Frame(cell, bg="white")
-                add_frame.pack(fill=tk.X, padx=2, pady=(2, 1))
+                add_frame.pack(fill=tk.X, padx=3, pady=(3, 1))
 
-                add_btn = tk.Label(add_frame, text="+ Add", font=("Helvetica", 8),
+                add_btn = tk.Label(add_frame, text="+ Add", font=("Helvetica", 10),
                                    fg="gray", bg="#f0f0f0", relief="raised", bd=1,
                                    cursor="hand2")
-                add_btn.pack(fill=tk.X)
+                add_btn.pack(fill=tk.X, ipady=2)
 
                 def open_popup(event=None):
+                    # Toggle: clicking the same +Add closes its open popup.
+                    if self._active_add_popup is not None:
+                        prev_btn = self._active_add_btn
+                        try:
+                            self._active_add_popup.destroy()
+                        except tk.TclError:
+                            pass
+                        self._active_add_popup = None
+                        self._active_add_btn = None
+                        if prev_btn is add_btn:
+                            return  # toggled off
+
                     popup = tk.Toplevel(parent)
                     popup.overrideredirect(True)
                     popup.attributes("-topmost", True)
@@ -1832,6 +2096,9 @@ class ToyoSchedulerApp:
                     x = add_btn.winfo_rootx()
                     y = add_btn.winfo_rooty() + add_btn.winfo_height()
                     popup.geometry(f"+{x}+{y}")
+
+                    self._active_add_popup = popup
+                    self._active_add_btn = add_btn
 
                     lb_frame = tk.Frame(popup)
                     lb_frame.pack(fill=tk.BOTH, expand=True)
@@ -1904,10 +2171,14 @@ class ToyoSchedulerApp:
                     popup.update_idletasks()
                     lb.focus_force()
 
-                    # Close popup when clicking anywhere outside it
+                    # Close popup when clicking anywhere outside it.
+                    # If the click lands on the active +Add button we let its
+                    # own handler run so it can toggle this popup off cleanly.
                     def _make_close_handler(p, toplevel):
                         def handler(event):
                             try:
+                                if event.widget is self._active_add_btn:
+                                    return
                                 p_str = str(p)
                                 w_str = str(event.widget)
                                 if w_str != p_str and not w_str.startswith(p_str + "."):
@@ -1920,6 +2191,9 @@ class ToyoSchedulerApp:
                                     toplevel.unbind("<Button-1>")
                                 except tk.TclError:
                                     pass
+                                if self._active_add_popup is p:
+                                    self._active_add_popup = None
+                                    self._active_add_btn = None
                         return handler, cleanup
                     _toplevel = parent.winfo_toplevel()
                     _click_handler, _destroy_handler = _make_close_handler(popup, _toplevel)
@@ -1928,6 +2202,74 @@ class ToyoSchedulerApp:
 
                 add_btn.bind("<Button-1>", open_popup)
 
+                # Typing textbox: type space-separated tokens like "ka kam sa".
+                # Each token resolves to the shortest name in full_list that
+                # starts with it (case-insensitive). Hit Enter to add them all.
+                # A live preview label shows what the tokens will resolve to.
+                type_entry = tk.Entry(cell, font=("Helvetica", 11), bd=1, relief="sunken")
+                type_entry.pack(fill=tk.X, padx=3, pady=(2, 0), ipady=2)
+                cell._type_entry = type_entry
+
+                preview_label = tk.Label(cell, text="", font=("Helvetica", 9, "italic"),
+                                         fg="#0066CC", bg="white", anchor="w")
+                preview_label.pack(fill=tk.X, padx=3, pady=(0, 3))
+
+                def resolve_token(tok):
+                    tok_low = tok.lower()
+                    matches = [n for n in cell._full_list
+                               if n and n.lower().startswith(tok_low)]
+                    if not matches:
+                        return None
+                    # Shortest first; alphabetical as deterministic tiebreaker
+                    matches.sort(key=lambda n: (len(n), n.lower()))
+                    return matches[0]
+
+                def update_preview(event=None):
+                    raw = type_entry.get().strip()
+                    if not raw:
+                        preview_label.config(text="", fg="#0066CC")
+                        return
+                    tokens = raw.split()
+                    parts = []
+                    any_miss = False
+                    for tok in tokens:
+                        m = resolve_token(tok)
+                        if m:
+                            parts.append(m)
+                        else:
+                            parts.append(f"?{tok}")
+                            any_miss = True
+                    preview_label.config(
+                        text="→ " + ", ".join(parts),
+                        fg="#CC0000" if any_miss else "#0066CC")
+
+                def on_type_enter(event=None):
+                    raw = type_entry.get().strip()
+                    if not raw:
+                        return "break"
+                    tokens = raw.split()
+                    selected_real = {extract_name(n) for n in cell._names}
+                    added_any = False
+                    for tok in tokens:
+                        match = resolve_token(tok)
+                        if not match or match in selected_real:
+                            continue
+                        cell._names.append(match)
+                        selected_real.add(match)
+                        added_any = True
+                    type_entry.delete(0, tk.END)
+                    preview_label.config(text="", fg="#0066CC")
+                    if added_any:
+                        sync_to_avail()
+                        refresh_cell()
+                        # refresh_cell rebuilds widgets — focus the NEW entry
+                        # so the user can immediately type the next name.
+                        cell._type_entry.focus_set()
+                    return "break"
+
+                type_entry.bind("<KeyRelease>", update_preview)
+                type_entry.bind("<Return>", on_type_enter)
+
             refresh_cell()
             return cell
 
@@ -1935,21 +2277,21 @@ class ToyoSchedulerApp:
             """Add a single shift-role section (e.g. Host Morning, Lunch Server)."""
             # Section header
             ttk.Label(self.avail_frame, text=title,
-                      font=("Helvetica", 12, "bold"), foreground="navy").grid(
-                row=row, column=0, columnspan=8, padx=5, pady=(10, 3), sticky="w")
+                      font=("Helvetica", 14, "bold"), foreground="navy").grid(
+                row=row, column=0, columnspan=8, padx=8, pady=(12, 4), sticky="w")
             row += 1
 
             # Day column headers
             ttk.Label(self.avail_frame, text="", width=10).grid(row=row, column=0)
             for di, day in enumerate(DAYS):
-                ttk.Label(self.avail_frame, text=day, font=("Helvetica", 10, "bold"),
-                          width=16).grid(row=row, column=di + 1, padx=2, pady=3)
+                ttk.Label(self.avail_frame, text=day, font=("Helvetica", 12, "bold"),
+                          width=16).grid(row=row, column=di + 1, padx=2, pady=4)
             row += 1
 
             # Staff cells
             ttk.Label(self.avail_frame, text=shift.capitalize(),
-                      font=("Helvetica", 10, "bold"), foreground=color).grid(
-                row=row, column=0, padx=5, pady=(5, 2), sticky="nw")
+                      font=("Helvetica", 12, "bold"), foreground=color).grid(
+                row=row, column=0, padx=8, pady=(6, 2), sticky="nw")
             for di, day in enumerate(DAYS):
                 key = (role_key, shift, day)
                 names = self._slot_names.get(key, [])
@@ -2020,14 +2362,18 @@ class ToyoSchedulerApp:
         self._build_availability_grid()
 
     def _save_availability(self):
-        # Full sync from cell widgets to avail_vars
+        # avail_vars live-sync into self.data.availability via trace_add as soon
+        # as cells are edited, so the in-memory state is always current. Save
+        # Availability just persists that state to disk for future sessions.
+        # We still do a defensive cell→avail_vars rebuild here in case anything
+        # got out of sync (the trace then propagates it to self.data.availability).
         if hasattr(self, '_cell_widgets'):
             def extract_name(display_val):
                 if not display_val:
                     return ""
                 return display_val
 
-            # Reset all non-fixed to off
+            # Reset all non-fixed to off, then rebuild from current cell contents
             for name, days in self.avail_vars.items():
                 staff = self.data.get_staff_by_name(name)
                 if staff and staff.get("fixed_schedule"):
@@ -2035,7 +2381,6 @@ class ToyoSchedulerApp:
                 for day in DAYS:
                     days[day].set("off")
 
-            # Rebuild from cells
             for (role_key, shift, day), cell in self._cell_widgets.items():
                 for display in cell._names:
                     real_name = extract_name(display)
@@ -2052,14 +2397,18 @@ class ToyoSchedulerApp:
                             else:
                                 self.avail_vars[real_name][day].set("night")
 
-        avail = {}
-        for name, days in self.avail_vars.items():
-            avail[name] = {}
-            for day, var in days.items():
-                avail[name][day] = var.get()
-        self.data.availability = avail
         self.data.save_availability()
         messagebox.showinfo("Saved", "Availability saved!")
+
+    def _revert_availability(self):
+        if not messagebox.askyesno(
+                "Revert Availability",
+                "Are you sure you want to revert availability to the last "
+                "saved version? Any unsaved changes will be lost."):
+            return
+        # Reload from disk and rebuild the grid (which reads self.data.availability)
+        self.data.availability = self.data._load_availability()
+        self._build_availability_grid()
 
     # ---- PHOTO IMPORT (OCR) ----
     def _import_from_photo(self):
@@ -2749,12 +3098,27 @@ class ToyoSchedulerApp:
                 add_btn.pack(fill=tk.X)
 
                 def open_popup(event=None):
+                    # Toggle: clicking the same +Add closes its open popup.
+                    if self._active_add_popup is not None:
+                        prev_btn = self._active_add_btn
+                        try:
+                            self._active_add_popup.destroy()
+                        except tk.TclError:
+                            pass
+                        self._active_add_popup = None
+                        self._active_add_btn = None
+                        if prev_btn is add_btn:
+                            return  # toggled off
+
                     popup = tk.Toplevel(parent)
                     popup.overrideredirect(True)
                     popup.attributes("-topmost", True)
                     x = add_btn.winfo_rootx()
                     y = add_btn.winfo_rooty() + add_btn.winfo_height()
                     popup.geometry(f"+{x}+{y}")
+
+                    self._active_add_popup = popup
+                    self._active_add_btn = add_btn
 
                     selected_real = {extract_name(n) for n in cell._names}
                     available = [n for n in cell._full_list if n and extract_name(n) not in selected_real]
@@ -2821,10 +3185,14 @@ class ToyoSchedulerApp:
                     popup.update_idletasks()
                     lb.focus_force()
 
-                    # Close popup when clicking anywhere outside it
+                    # Close popup when clicking anywhere outside it.
+                    # If the click lands on the active +Add button we let its
+                    # own handler run so it can toggle this popup off cleanly.
                     def _make_close_handler(p, toplevel):
                         def handler(event):
                             try:
+                                if event.widget is self._active_add_btn:
+                                    return
                                 p_str = str(p)
                                 w_str = str(event.widget)
                                 if w_str != p_str and not w_str.startswith(p_str + "."):
@@ -2837,6 +3205,9 @@ class ToyoSchedulerApp:
                                     toplevel.unbind("<Button-1>")
                                 except tk.TclError:
                                     pass
+                                if self._active_add_popup is p:
+                                    self._active_add_popup = None
+                                    self._active_add_btn = None
                         return handler, cleanup
                     _toplevel = parent.winfo_toplevel()
                     _click_handler, _destroy_handler = _make_close_handler(popup, _toplevel)
@@ -3058,26 +3429,44 @@ class ToyoSchedulerApp:
                 hibachi_lunch = self.current_schedule[day]["hibachi_lunch_servers"]
                 servers = self.current_schedule[day]["lunch_servers"]
                 letters = self.current_schedule[day].get("lunch_server_letters", {})
+                b_side = self.current_schedule[day].get("b_side_lunch", [])
                 hib_set = set(hibachi_lunch)
-                # Sort by letter, hibachi after regular within same letter
+                b_set = set(b_side)
+                # B-side on top, then regular A,B,C..., then hibachi (within letter)
                 combined = servers + hibachi_lunch
-                combined.sort(key=lambda n: (letters.get(n, "Z"), 1 if n in hib_set else 0))
+                combined.sort(key=lambda n: (
+                    0 if n in b_set else 1,
+                    letters.get(n, "Z"),
+                    1 if n in hib_set else 0,
+                ))
                 mids = self.current_schedule[day].get("mid_servers", [])
                 if si < len(combined):
                     name = combined[si]
                     letter = letters.get(name, chr(65 + si))
                     mid = "*" if name in mids else ""
-                    is_hib = name in hibachi_lunch
-                    text = f"{name} {letter}{mid}"
-                    if is_hib:
+                    is_hib = name in hib_set
+                    is_b = name in b_set
+                    text = f"<{name} {letter}>{mid}" if is_b else f"{name} {letter}{mid}"
+                    if is_b:
+                        bg = "#ADD8E6"  # light blue for sushi/B-side
+                    elif is_hib:
                         bg = "#FFE4B5"
                     else:
                         bg = "#E8F5E9" if mid else "white"
-                    lbl = tk.Label(self.sched_inner, text=text, width=18,
+                    cell = tk.Frame(self.sched_inner, bg=bg, relief="groove", bd=1)
+                    cell.grid(row=row + si, column=di + 1, padx=1, pady=1, sticky="nsew")
+                    lbl = tk.Label(cell, text=text, width=15,
                                   font=("Helvetica", 9), anchor="center",
-                                  bg=bg, relief="groove", bd=1, cursor="hand2")
-                    lbl.grid(row=row + si, column=di + 1, padx=1, pady=1)
+                                  bg=bg, cursor="hand2", bd=0)
+                    lbl.pack(side="left", fill="both", expand=True)
                     lbl.bind("<Button-1>", lambda e, d=day, k="lunch_servers", i=si: self._edit_cell(d, k, i))
+                    btn_bg = "#4A90E2" if is_b else "#DDDDDD"
+                    btn_fg = "white" if is_b else "#333333"
+                    bbtn = tk.Label(cell, text="B", width=2,
+                                    font=("Helvetica", 8, "bold"),
+                                    bg=btn_bg, fg=btn_fg, cursor="hand2", bd=1, relief="raised")
+                    bbtn.pack(side="right", fill="y")
+                    bbtn.bind("<Button-1>", lambda e, d=day, n=name: self._toggle_b_side(d, "lunch", n))
         row += max(max_ls, 1) + 1
 
         # Lunch Manager
@@ -3131,26 +3520,44 @@ class ToyoSchedulerApp:
                 hibachi = self.current_schedule[day]["hibachi_servers"]
                 servers = self.current_schedule[day]["dinner_servers"]
                 letters = self.current_schedule[day].get("dinner_server_letters", {})
+                b_side = self.current_schedule[day].get("b_side_dinner", [])
                 hib_set = set(hibachi)
-                # Sort by letter, hibachi after regular within same letter
+                b_set = set(b_side)
+                # B-side on top, then regular A,B,C..., then hibachi (within letter)
                 combined = servers + hibachi
-                combined.sort(key=lambda n: (letters.get(n, "Z"), 1 if n in hib_set else 0))
+                combined.sort(key=lambda n: (
+                    0 if n in b_set else 1,
+                    letters.get(n, "Z"),
+                    1 if n in hib_set else 0,
+                ))
                 mids = self.current_schedule[day].get("mid_servers", [])
                 if si < len(combined):
                     name = combined[si]
                     letter = letters.get(name, chr(65 + si))
                     mid = "*" if name in mids else ""
-                    is_hib = name in hibachi
-                    text = f"{name} {letter}{mid}"
-                    if is_hib:
+                    is_hib = name in hib_set
+                    is_b = name in b_set
+                    text = f"<{name} {letter}>{mid}" if is_b else f"{name} {letter}{mid}"
+                    if is_b:
+                        bg = "#ADD8E6"  # light blue for sushi/B-side
+                    elif is_hib:
                         bg = "#FFE4B5"
                     else:
                         bg = "#E8F5E9" if mid else "white"
-                    lbl = tk.Label(self.sched_inner, text=text, width=18,
+                    cell = tk.Frame(self.sched_inner, bg=bg, relief="groove", bd=1)
+                    cell.grid(row=row + si, column=di + 1, padx=1, pady=1, sticky="nsew")
+                    lbl = tk.Label(cell, text=text, width=15,
                                   font=("Helvetica", 9), anchor="center",
-                                  bg=bg, relief="groove", bd=1, cursor="hand2")
-                    lbl.grid(row=row + si, column=di + 1, padx=1, pady=1)
+                                  bg=bg, cursor="hand2", bd=0)
+                    lbl.pack(side="left", fill="both", expand=True)
                     lbl.bind("<Button-1>", lambda e, d=day, k="dinner_servers", i=si: self._edit_cell(d, k, i))
+                    btn_bg = "#4A90E2" if is_b else "#DDDDDD"
+                    btn_fg = "white" if is_b else "#333333"
+                    bbtn = tk.Label(cell, text="B", width=2,
+                                    font=("Helvetica", 8, "bold"),
+                                    bg=btn_bg, fg=btn_fg, cursor="hand2", bd=1, relief="raised")
+                    bbtn.pack(side="right", fill="y")
+                    bbtn.bind("<Button-1>", lambda e, d=day, n=name: self._toggle_b_side(d, "dinner", n))
         row += max(max_ds, 1) + 1
 
         # Dinner Hosts
@@ -3228,6 +3635,118 @@ class ToyoSchedulerApp:
 
         options.sort(key=lambda x: x[1].lower())
         return options
+
+    def _toggle_b_side(self, day, shift, name):
+        """Toggle a staff member's B-side (sushi side) assignment for a shift.
+
+        shift = 'lunch' or 'dinner'. B-side staff get letters W, X, Y in order
+        (max 3 per shift). B-side and hibachi are mutually exclusive — toggling
+        someone in pulls them out of hibachi if they were there, and a regular
+        server is promoted into the vacated hibachi slot.
+        """
+        if not self.current_schedule:
+            return
+        b_key = "b_side_lunch" if shift == "lunch" else "b_side_dinner"
+        hib_key = "hibachi_lunch_servers" if shift == "lunch" else "hibachi_servers"
+        reg_key = "lunch_servers" if shift == "lunch" else "dinner_servers"
+
+        b_list = self.current_schedule[day].setdefault(b_key, [])
+
+        if name in b_list:
+            b_list.remove(name)
+        else:
+            if len(b_list) >= 3:
+                messagebox.showinfo("B-side full",
+                    "Maximum 3 B-side (sushi side) staff per shift.")
+                return
+            # Pull out of hibachi if present (B-side and hibachi are exclusive),
+            # then backfill the vacated hibachi slot from the regular server pool.
+            hib_list = self.current_schedule[day][hib_key]
+            vacated_hibachi = name in hib_list
+            if vacated_hibachi:
+                hib_list.remove(name)
+                if name not in self.current_schedule[day][reg_key]:
+                    self.current_schedule[day][reg_key].append(name)
+            b_list.append(name)
+            if vacated_hibachi:
+                self._backfill_hibachi(day, shift)
+
+        # Re-run sidework letter assignment so W/X/Y reflect the change
+        self.generator.schedule = self.current_schedule
+        self.generator._assign_sidework_letters()
+        self._display_schedule()
+
+    def _backfill_hibachi(self, day, shift):
+        """Promote regular servers into hibachi until the day's target is met.
+
+        Selection priority:
+        1. Servers below their personal weekly hibachi target (target=2 for
+           most, target=1 for senior staff like Andy/Dian/Leony) — they need
+           to fill their requirement first.
+        2. Within that group, fewest current hibachi shifts first.
+        3. Random tiebreaker for full ties.
+        4. As a last resort, servers already at/over their target are still
+           pickable so the day's hibachi requirement always gets filled. Within
+           that fallback group, the LEAST senior staff get targeted first
+           (so Andy at seniority 6 gets the extra shift before Leony/Dian at 10),
+           with random tiebreaker for equal seniorities.
+
+        Skips emergency_only and always_hibachi staff, plus anyone already
+        marked B-side for that shift.
+        """
+        config = self.data.config
+        if shift == "lunch":
+            slot_target = config["staffing"][day].get("hibachi_lunch", 0)
+            hib_list = self.current_schedule[day]["hibachi_lunch_servers"]
+            reg_list = self.current_schedule[day]["lunch_servers"]
+            b_set = set(self.current_schedule[day].get("b_side_lunch", []))
+        else:
+            slot_target = config["staffing"][day].get("hibachi_dinner", 0)
+            hib_list = self.current_schedule[day]["hibachi_servers"]
+            reg_list = self.current_schedule[day]["dinner_servers"]
+            b_set = set(self.current_schedule[day].get("b_side_dinner", []))
+
+        needed = slot_target - len(hib_list)
+        if needed <= 0:
+            return
+
+        # Tally hibachi shifts across the week so we balance the swap-in choice
+        week_hib_counts = {}
+        for d in DAYS:
+            for n in self.current_schedule[d]["hibachi_lunch_servers"]:
+                week_hib_counts[n] = week_hib_counts.get(n, 0) + 1
+            for n in self.current_schedule[d]["hibachi_servers"]:
+                week_hib_counts[n] = week_hib_counts.get(n, 0) + 1
+
+        eligible = []
+        for n in reg_list:
+            if n in b_set:
+                continue
+            staff = self.data.get_staff_by_name(n)
+            if not staff:
+                continue
+            flags = staff.get("flags", [])
+            if "emergency_only" in flags or "always_hibachi" in flags:
+                continue
+            eligible.append(n)
+
+        # Shuffle first so full ties resolve randomly (stable sort preserves order otherwise)
+        random.shuffle(eligible)
+
+        def seniority_of(n):
+            return (self.data.get_staff_by_name(n) or {}).get("seniority", 0)
+
+        # Sort: under-target group first (by fewest count), then over-target
+        # group (by lowest seniority — least senior absorbs the extra shift).
+        # Random pre-shuffle handles ties within each tier.
+        eligible.sort(key=lambda n: (
+            0 if week_hib_counts.get(n, 0) < hibachi_target(n) else 1,
+            week_hib_counts.get(n, 0) if week_hib_counts.get(n, 0) < hibachi_target(n) else seniority_of(n),
+        ))
+
+        for picked in eligible[:needed]:
+            reg_list.remove(picked)
+            hib_list.append(picked)
 
     def _edit_cell(self, day, key, index):
         """Let manager swap a staff member in a cell via searchable dropdown."""
@@ -3313,6 +3832,15 @@ class ToyoSchedulerApp:
                     lst.pop(index)
                 else:
                     lst[index] = new_name
+
+            # Clean up B-side membership for the removed/replaced name
+            if new_name != current_name:
+                for b_key in ("b_side_lunch", "b_side_dinner"):
+                    b_list = self.current_schedule[day].get(b_key, [])
+                    if current_name in b_list:
+                        b_list.remove(current_name)
+                self.generator.schedule = self.current_schedule
+                self.generator._assign_sidework_letters()
 
             self._display_schedule()
             dlg.destroy()
