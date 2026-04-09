@@ -2267,12 +2267,13 @@ class ToyoSchedulerApp:
             ("Day Offs",
              "Recurring days a staff member doesn't work. Currently this "
              "field is only enforced for fulltimers (staff with the "
-             "fixed_schedule flag) — Aaron, Chan, Dian, Leony. The scheduler "
-             "uses it as the off-day fallback for fulltimers when no "
-             "explicit availability is set, and the 'Set Default' button "
-             "on the Availability tab restores fulltimers to their off-days. "
-             "For non-fulltimer staff, the field is saved but ignored — "
-             "their availability comes entirely from the Availability tab."),
+             "fixed_schedule flag) — Aaron, Chan, Dian, Leony, and Olivia. "
+             "The scheduler uses it as the off-day fallback for fulltimers "
+             "when no explicit availability is set, and the 'Set Default' "
+             "button on the Availability tab restores fulltimers to their "
+             "off-days. For non-fulltimer staff, the field is saved but "
+             "ignored — their availability comes entirely from the "
+             "Availability tab."),
         ]
 
         win = tk.Toplevel(parent)
