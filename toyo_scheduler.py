@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import copy
+import math
 import random
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -152,8 +153,13 @@ DEFAULT_STAFF = [
      "active": True, "flags": [], "role_preference": "host"},
     {"name": "Catie Grey", "roles": ["host"], "seniority": 4, "fixed_schedule": False,
      "active": True, "flags": [], "role_preference": "host"},
-    {"name": "Olivia", "roles": ["host"], "seniority": 8, "fixed_schedule": False,
-     "active": True, "flags": ["seniority_priority"], "role_preference": "host"},
+    {"name": "Olivia", "roles": ["host"], "seniority": 8, "fixed_schedule": True,
+     "active": True, "flags": ["seniority_priority"], "role_preference": "host",
+     "default_availability": {
+         "MON": "morning", "TUE": "morning", "WED": "morning",
+         "THU": "morning", "FRI": "morning",
+     },
+     "default_off": ["SAT", "SUN"]},
     {"name": "Lilly", "roles": ["host"], "seniority": 4, "fixed_schedule": False,
      "active": True, "flags": [], "role_preference": "host"},
     {"name": "Ashlyn", "roles": ["host"], "seniority": 4, "fixed_schedule": False,
@@ -1426,6 +1432,683 @@ class PDFExporter:
 # ---------------------------------------------------------------------------
 # Main Application GUI
 # ---------------------------------------------------------------------------
+class _ExplorerGame:
+    """2D Zelda-ish dungeon easter egg.
+
+    Pitch-black room lit only by 7 torches. Enemies enter from the sides;
+    space swings a sword that auto-aims at the nearest enemy with a small
+    splash radius and a cooldown. Enemies take 3 hits, get knocked back, and
+    have a 25% chance to drop a blue soul. Walk a soul onto a torch to
+    extinguish it (you need its light less; the dungeon gets darker). Put
+    out all 7 torches to win.
+    """
+
+    TILE = 32
+    COLS = 30
+    ROWS = 18
+    HUD_HEIGHT = 38
+    FRAME_MS = 90   # ~11 FPS
+
+    SWORD_RANGE = 2.2     # was 3.6 — shorter reach, get closer to swing
+    SWORD_SPLASH = 1.4
+    SWORD_COOLDOWN = 16   # was 7 — slower swing makes the game harder
+    ENEMY_HP = 3
+    ENEMY_SPEED = 0.085
+    ENEMY_KNOCKBACK = 1.6
+    ENEMY_KNOCKBACK_DECAY = 0.55
+    ENEMY_DAMAGE_RANGE = 0.75  # how close before they hit you
+    SPAWN_INTERVAL = 22  # frames between spawns
+    SOUL_DROP_RATE = 0.25
+    SOUL_DROP_RATE_LATE = 0.125   # halved chance for the final 2 souls
+    SOUL_MAX_TOTAL = 7
+    SOUL_LATE_THRESHOLD = 5       # after this many "in flight", switch to LATE rate
+    SOUL_TTL_FRAMES = 111         # ~10 seconds at FRAME_MS=90
+    NUM_TORCHES = 7
+    POWERUP_DAMAGE_DROP_RATE = 0.01
+    POWERUP_HEART_DROP_RATE = 0.01
+    DAMAGE_BOOST_FRAMES = 167     # ~15 seconds of 2x sword damage
+    BOMB_RADIUS = 4.0             # tiles affected by the soul-bomb cheat
+    BOMB_ANIM_FRAMES = 6
+    PLAYER_MAX_HP = 3
+    PLAYER_IFRAMES = 14
+    VISIBILITY_THRESHOLD = 0.15  # enemies below this light intensity stay hidden
+
+    def __init__(self, parent):
+        self.win = tk.Toplevel(parent)
+        self.win.title("???")
+        self.win.resizable(False, False)
+        self.win.configure(bg="black")
+        self.win.transient(parent)
+
+        w = self.COLS * self.TILE
+        h = self.ROWS * self.TILE + self.HUD_HEIGHT
+        self.canvas = tk.Canvas(self.win, width=w, height=h,
+                                bg="black", highlightthickness=0)
+        self.canvas.pack()
+
+        # No walls — open dungeon floor. Player and enemies are still kept in
+        # bounds by the COLS/ROWS check in _move and _update_enemies.
+        self.walls = set()
+
+        # 7 torches scattered through the dungeon. Each is a dict so we can
+        # toggle "lit" when extinguished by a soul.
+        torch_positions = [
+            (3, 2), (14, 2), (26, 2),
+            (3, 15), (26, 15),
+            (10, 9), (19, 9),
+        ]
+        self.torches = [{"x": x, "y": y, "lit": True} for (x, y) in torch_positions]
+
+        # Player
+        self.px, self.py = self.COLS // 2, self.ROWS - 3
+        self.sword_cooldown = 0
+        self.swing_anim = 0   # frames remaining of sword swing visual
+        self.swing_target = None  # (cx, cy) of last swing
+        # carried_souls is now a list of TTL counters (one per carried soul).
+        # Souls expire from the inventory if not used in time.
+        self.carried_souls = []
+        self.hp = self.PLAYER_MAX_HP
+        self.iframes = 0
+        self.alive = True
+        self.won = False
+        self.game_over = False
+
+        # Entities
+        self.enemies = []   # {x, y, hp, kx, ky, hit_flash}
+        self.souls = []     # {x, y, ttl}  — ttl in frames; despawn at 0
+        self.power_ups = []  # {x, y, kind}  kind: "damage" | "heart"
+        self.damage_boost = 0  # frames remaining of 2x sword damage
+        self.bomb_anim = 0  # frames remaining of soul-bomb explosion visual
+
+        # Bindings — WASD only, plus space to attack
+        for k, dx, dy in [
+            ("w", 0, -1), ("a", -1, 0), ("s", 0, 1), ("d", 1, 0),
+            ("W", 0, -1), ("A", -1, 0), ("S", 0, 1), ("D", 1, 0),
+        ]:
+            self.win.bind(k, lambda e, dx=dx, dy=dy: self._move(dx, dy))
+        self.win.bind("<space>", lambda e: self._attack())
+        # Hidden cheat: B consumes one carried soul as a mid-range bomb.
+        self.win.bind("b", lambda e: self._bomb())
+        self.win.bind("B", lambda e: self._bomb())
+        self.win.bind("<Escape>", lambda e: self._close())
+        self.win.protocol("WM_DELETE_WINDOW", self._close)
+        self.win.focus_set()
+
+        self._frame = 0
+        self._spawn_counter = 0
+        self._animate()
+
+    # ---- input / actions ----
+
+    def _close(self):
+        self.alive = False
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+    def _move(self, dx, dy):
+        if not self.alive or self.won:
+            return
+        nx, ny = self.px + dx, self.py + dy
+        if (nx, ny) in self.walls:
+            return
+        if not (0 <= nx < self.COLS and 0 <= ny < self.ROWS):
+            return
+        self.px, self.py = nx, ny
+
+        # Pick up any souls on this tile — each becomes a fresh inventory TTL
+        keep = []
+        for s in self.souls:
+            if s["x"] == nx and s["y"] == ny:
+                self.carried_souls.append(self.SOUL_TTL_FRAMES)
+            else:
+                keep.append(s)
+        self.souls = keep
+
+        # Pick up any power-ups on this tile. Hearts are only consumed if the
+        # player actually has room to heal; damage boosts always apply.
+        keep_pu = []
+        for p in self.power_ups:
+            if p["x"] == nx and p["y"] == ny:
+                if p["kind"] == "damage":
+                    self.damage_boost = self.DAMAGE_BOOST_FRAMES
+                    continue
+                elif p["kind"] == "heart":
+                    if self.hp < self.PLAYER_MAX_HP:
+                        self.hp += 1
+                        continue
+            keep_pu.append(p)
+        self.power_ups = keep_pu
+
+        # Feed a soul to a torch on this tile (if any, and we have one).
+        # Use the oldest soul first (FIFO) so the timer pressure is fair.
+        for t in self.torches:
+            if t["x"] == nx and t["y"] == ny and t["lit"] and self.carried_souls:
+                t["lit"] = False
+                self.carried_souls.pop(0)
+                if all(not tt["lit"] for tt in self.torches):
+                    self._win()
+                break
+
+    def _attack(self):
+        if not self.alive or self.won or self.game_over or self.sword_cooldown > 0:
+            return
+        # Cooldown applies on EVERY swing — even if it whiffs — so spamming
+        # space when no enemy is around is genuinely punished.
+        self.sword_cooldown = self.SWORD_COOLDOWN
+        self.swing_anim = 2
+        # Auto-aim: nearest enemy within range
+        target = None
+        best = self.SWORD_RANGE
+        for e in self.enemies:
+            d = math.hypot(e["x"] - self.px, e["y"] - self.py)
+            if d <= best:
+                best = d
+                target = e
+        if target is None:
+            # Whiff — no damage, but the swing still played and cooldown is set.
+            # Mark target as None so the draw code shows a miss arc instead.
+            self.swing_target = None
+            return
+        self.swing_target = (target["x"], target["y"])
+        # Apply damage + knockback to target and anyone in splash radius.
+        # Damage doubles while a damage-boost power-up is active.
+        sword_damage = 2 if self.damage_boost > 0 else 1
+        for e in self.enemies:
+            d = math.hypot(e["x"] - target["x"], e["y"] - target["y"])
+            if d <= self.SWORD_SPLASH:
+                e["hp"] -= sword_damage
+                kdx = e["x"] - self.px
+                kdy = e["y"] - self.py
+                kd = math.hypot(kdx, kdy)
+                if kd > 0.01:
+                    kdx /= kd
+                    kdy /= kd
+                else:
+                    kdx, kdy = 0, -1
+                e["kx"] = kdx * self.ENEMY_KNOCKBACK
+                e["ky"] = kdy * self.ENEMY_KNOCKBACK
+                e["hit_flash"] = 3
+        self._process_enemy_deaths()
+
+    def _process_enemy_deaths(self):
+        """Remove dead enemies, roll soul/power-up drops on each kill.
+
+        Soul drop cap: extinguished torches + on-ground + carried < 7.
+        Last 2 souls drop at half rate. Power-ups roll independently."""
+        survivors = []
+        for e in self.enemies:
+            if e["hp"] <= 0:
+                ex_int = int(round(e["x"]))
+                ey_int = int(round(e["y"]))
+                used = sum(1 for t in self.torches if not t["lit"])
+                in_flight = len(self.souls) + len(self.carried_souls)
+                accounted = used + in_flight
+                if accounted < self.SOUL_MAX_TOTAL:
+                    rate = (self.SOUL_DROP_RATE_LATE
+                            if accounted >= self.SOUL_LATE_THRESHOLD
+                            else self.SOUL_DROP_RATE)
+                    if random.random() < rate:
+                        self.souls.append({
+                            "x": ex_int, "y": ey_int,
+                            "ttl": self.SOUL_TTL_FRAMES,
+                        })
+                if random.random() < self.POWERUP_DAMAGE_DROP_RATE:
+                    self.power_ups.append({
+                        "x": ex_int, "y": ey_int, "kind": "damage",
+                    })
+                if random.random() < self.POWERUP_HEART_DROP_RATE:
+                    self.power_ups.append({
+                        "x": ex_int, "y": ey_int, "kind": "heart",
+                    })
+            else:
+                survivors.append(e)
+        self.enemies = survivors
+
+    def _bomb(self):
+        """Hidden cheat: consume the oldest carried soul as a bomb. Mid-range
+        blue splash damage equal to two sword swings. The soul does NOT count
+        toward the 7 needed — popping it from the inventory frees the cap so
+        an enemy can drop a replacement."""
+        if not self.alive or self.won or self.game_over:
+            return
+        if not self.carried_souls:
+            return
+        self.carried_souls.pop(0)
+        self.bomb_anim = self.BOMB_ANIM_FRAMES
+        sword_damage = 2 if self.damage_boost > 0 else 1
+        bomb_damage = sword_damage * 2  # "2 sword swings worth"
+        for e in self.enemies:
+            d = math.hypot(e["x"] - self.px, e["y"] - self.py)
+            if d <= self.BOMB_RADIUS:
+                e["hp"] -= bomb_damage
+                kdx = e["x"] - self.px
+                kdy = e["y"] - self.py
+                kd = math.hypot(kdx, kdy)
+                if kd > 0.01:
+                    kdx /= kd
+                    kdy /= kd
+                else:
+                    kdx, kdy = 0, -1
+                e["kx"] = kdx * self.ENEMY_KNOCKBACK * 1.6
+                e["ky"] = kdy * self.ENEMY_KNOCKBACK * 1.6
+                e["hit_flash"] = 4
+        self._process_enemy_deaths()
+
+    # ---- entity update ----
+
+    def _spawn_enemy(self):
+        # Enter from the left or right edge
+        side = random.choice(("left", "right"))
+        x = 1 if side == "left" else self.COLS - 2
+        y = random.randint(2, self.ROWS - 3)
+        if (x, y) in self.walls:
+            return
+        self.enemies.append({
+            "x": float(x), "y": float(y),
+            "hp": self.ENEMY_HP,
+            "kx": 0.0, "ky": 0.0,
+            "hit_flash": 0,
+        })
+
+    def _update_enemies(self):
+        for e in self.enemies:
+            # Knockback first (overrides AI movement while it lasts)
+            if abs(e["kx"]) > 0.05 or abs(e["ky"]) > 0.05:
+                nx = e["x"] + e["kx"]
+                ny = e["y"] + e["ky"]
+                if (0 <= nx < self.COLS and 0 <= ny < self.ROWS
+                        and (int(round(nx)), int(round(ny))) not in self.walls):
+                    e["x"] = nx
+                    e["y"] = ny
+                e["kx"] *= self.ENEMY_KNOCKBACK_DECAY
+                e["ky"] *= self.ENEMY_KNOCKBACK_DECAY
+            else:
+                # Walk toward player
+                dx = self.px - e["x"]
+                dy = self.py - e["y"]
+                d = math.hypot(dx, dy)
+                if d > 0.4:
+                    nx = e["x"] + dx / d * self.ENEMY_SPEED
+                    ny = e["y"] + dy / d * self.ENEMY_SPEED
+                    if (int(round(nx)), int(round(ny))) not in self.walls:
+                        e["x"] = nx
+                        e["y"] = ny
+            if e["hit_flash"] > 0:
+                e["hit_flash"] -= 1
+
+        # Damage check: any enemy within ENEMY_DAMAGE_RANGE of player
+        # deals 1 damage if iframes are 0.
+        if self.iframes == 0 and self.hp > 0 and not self.game_over:
+            for e in self.enemies:
+                d = math.hypot(e["x"] - self.px, e["y"] - self.py)
+                if d < self.ENEMY_DAMAGE_RANGE:
+                    self.hp -= 1
+                    self.iframes = self.PLAYER_IFRAMES
+                    if self.hp <= 0:
+                        self._trigger_game_over()
+                    break
+
+    # ---- frame loop ----
+
+    def _animate(self):
+        if not self.alive:
+            return
+        if self.won or self.game_over:
+            return
+        self._frame += 1
+        if self.sword_cooldown > 0:
+            self.sword_cooldown -= 1
+        if self.swing_anim > 0:
+            self.swing_anim -= 1
+        if self.iframes > 0:
+            self.iframes -= 1
+        if self.damage_boost > 0:
+            self.damage_boost -= 1
+        if self.bomb_anim > 0:
+            self.bomb_anim -= 1
+        # Tick soul TTLs (ground + carried) and prune expired
+        for s in self.souls:
+            s["ttl"] -= 1
+        self.souls = [s for s in self.souls if s["ttl"] > 0]
+        self.carried_souls = [t - 1 for t in self.carried_souls if t - 1 > 0]
+        self._spawn_counter += 1
+        if self._spawn_counter >= self.SPAWN_INTERVAL:
+            self._spawn_counter = 0
+            self._spawn_enemy()
+        self._update_enemies()
+        # _update_enemies may have triggered game over — draw the GO screen
+        # AFTER the regular game frame would overwrite it. (Previously the
+        # immediate draw inside _trigger_game_over got clobbered by self._draw.)
+        if self.game_over:
+            self._draw_game_over_screen()
+            return
+        self._draw()
+        try:
+            self.win.after(self.FRAME_MS, self._animate)
+        except tk.TclError:
+            pass
+
+    def _win(self):
+        self.won = True
+        self._draw_win_screen()
+        self.win.after(5000, self._close)
+
+    def _trigger_game_over(self):
+        self.game_over = True
+        # The actual draw happens at the end of the current _animate tick,
+        # so the regular _draw() call doesn't overwrite the GO screen.
+        self.win.after(5000, self._close)
+
+    def _draw_game_over_screen(self):
+        c = self.canvas
+        c.delete("all")
+        w = self.COLS * self.TILE
+        h = self.ROWS * self.TILE + self.HUD_HEIGHT
+        c.create_rectangle(0, 0, w, h, fill="black", outline="")
+        c.create_text(w / 2, h / 2 - 26,
+                      text="GAME OVER",
+                      fill="#FF4444", font=("Courier", 32, "bold"))
+        c.create_text(w / 2, h / 2 + 24,
+                      text="The Toyo crew is gone...",
+                      fill="white", font=("Courier", 14, "bold"))
+
+    # 8-bit pixel art of the Philosopher's Stone — a red diamond gem with
+    # white inner highlights and a darker outer rim. '.' = transparent.
+    PHILOSOPHER_STONE_ART = [
+        ".....R.....",
+        "....RRR....",
+        "...RRrRR...",
+        "..RRrwrRR..",
+        ".RRrwwwrRR.",
+        "RRrwwwwwrRR",
+        ".RRrwwwrRR.",
+        "..RRrwrRR..",
+        "...RRrRR...",
+        "....RRR....",
+        ".....R.....",
+    ]
+    PHILOSOPHER_STONE_PALETTE = {
+        "R": "#5A0000",
+        "r": "#D32F2F",
+        "w": "#FFFFFF",
+    }
+
+    def _draw_philosopher_stone(self, cx, cy, pixel=10):
+        """Render the 8-bit philosopher stone centered on (cx, cy)."""
+        c = self.canvas
+        rows = self.PHILOSOPHER_STONE_ART
+        h = len(rows)
+        w = len(rows[0])
+        x0 = cx - (w * pixel) // 2
+        y0 = cy - (h * pixel) // 2
+        for ry, row in enumerate(rows):
+            for rx, ch in enumerate(row):
+                color = self.PHILOSOPHER_STONE_PALETTE.get(ch)
+                if color is None:
+                    continue
+                px0 = x0 + rx * pixel
+                py0 = y0 + ry * pixel
+                c.create_rectangle(px0, py0, px0 + pixel, py0 + pixel,
+                                   fill=color, outline="")
+
+    def _draw_win_screen(self):
+        c = self.canvas
+        c.delete("all")
+        w = self.COLS * self.TILE
+        h = self.ROWS * self.TILE + self.HUD_HEIGHT
+        c.create_rectangle(0, 0, w, h, fill="black", outline="")
+        # Pixel art philosopher's stone above the text
+        self._draw_philosopher_stone(w / 2, h / 2 - 80, pixel=12)
+        c.create_text(w / 2, h / 2 + 60,
+                      text="You have collected all 7 souls.",
+                      fill="white", font=("Courier", 18, "bold"))
+        c.create_text(w / 2, h / 2 + 100,
+                      text="You have obtained The Philosopher Stone.",
+                      fill="white", font=("Courier", 18, "bold"))
+
+    # ---- rendering ----
+
+    def _draw(self):
+        c = self.canvas
+        c.delete("all")
+        T = self.TILE
+
+        # Build per-frame light source list. Each entry: (lx, ly, lr, color)
+        # color = "warm" for player + torches, "blue" for souls.
+        sources = []
+        sources.append((self.px + 0.5, self.py + 0.5,
+                        2.9 + random.uniform(-0.12, 0.12), "warm"))
+        for ti, t in enumerate(self.torches):
+            if not t["lit"]:
+                continue
+            base = 4.4
+            jitter = (math.sin(self._frame * 0.5 + ti * 1.3) * 0.22
+                      + random.uniform(-0.3, 0.3))
+            sources.append((t["x"] + 0.5, t["y"] + 0.5, base + jitter, "warm"))
+        for s in self.souls:
+            # Fresh souls cast a much brighter light; the radius shrinks as
+            # the TTL ticks down so dying souls only barely glow.
+            ttl_ratio = max(0.0, s["ttl"] / self.SOUL_TTL_FRAMES)
+            sr = 1.0 + 2.6 * ttl_ratio + random.uniform(-0.15, 0.15)
+            sources.append((s["x"] + 0.5, s["y"] + 0.5, sr, "blue"))
+
+        # Per-tile lighting: pick the strongest contribution and use its color.
+        for y in range(self.ROWS):
+            for x in range(self.COLS):
+                cx, cy = x + 0.5, y + 0.5
+                best_i = 0.0
+                best_color = "warm"
+                for lx, ly, lr, ct in sources:
+                    d = math.hypot(cx - lx, cy - ly)
+                    if d < lr:
+                        i = (1.0 - d / lr) ** 1.4
+                        if i > best_i:
+                            best_i = i
+                            best_color = ct
+                if best_i < 0.04:
+                    continue
+                is_wall = (x, y) in self.walls
+                fill = self._tile_color(best_i, is_wall, best_color)
+                c.create_rectangle(x * T, y * T,
+                                   (x + 1) * T, (y + 1) * T,
+                                   fill=fill, outline="")
+
+        # Lit torches
+        for t in self.torches:
+            if t["lit"]:
+                self._draw_flame(t["x"] * T + T // 2, t["y"] * T + T // 2 + 2,
+                                 hue="warm")
+
+        # Souls on the ground (blue dynamic fires) — flame size also scales
+        # with remaining TTL so a dying soul shrinks visibly.
+        for s in self.souls:
+            ttl_ratio = max(0.05, s["ttl"] / self.SOUL_TTL_FRAMES)
+            scale = 0.4 + 0.7 * ttl_ratio
+            self._draw_flame(s["x"] * T + T // 2, s["y"] * T + T // 2 + 2,
+                             hue="blue", scale=scale)
+
+        # Power-ups on the ground — always visible (slight pulse)
+        pulse = 1.0 + math.sin(self._frame * 0.4) * 0.15
+        for p in self.power_ups:
+            cx = p["x"] * T + T // 2
+            cy = p["y"] * T + T // 2
+            if p["kind"] == "damage":
+                # Yellow diamond with bright outline
+                size = int(9 * pulse)
+                pts = [cx, cy - size, cx + size, cy,
+                       cx, cy + size, cx - size, cy]
+                c.create_polygon(pts, fill="#FFD700", outline="#FFF59D", width=2)
+                c.create_text(cx, cy, text="2x",
+                              fill="#5A4400", font=("Helvetica", 7, "bold"))
+            elif p["kind"] == "heart":
+                size = int(9 * pulse)
+                # Heart polygon
+                pts = [
+                    cx, cy + size,
+                    cx + size, cy,
+                    cx + int(size * 0.55), cy - int(size * 0.7),
+                    cx, cy - int(size * 0.15),
+                    cx - int(size * 0.55), cy - int(size * 0.7),
+                    cx - size, cy,
+                ]
+                c.create_polygon(pts, fill="#FF3B3B",
+                                 outline="#FFCDD2", width=2)
+
+        # Enemies — only visible if their tile is lit above the threshold.
+        # Hit-flash enemies are always shown briefly so feedback is readable.
+        for e in self.enemies:
+            cx, cy = e["x"] + 0.5, e["y"] + 0.5
+            best = 0.0
+            for lx, ly, lr, _ in sources:
+                d = math.hypot(cx - lx, cy - ly)
+                if d < lr:
+                    i = (1.0 - d / lr) ** 1.4
+                    if i > best:
+                        best = i
+            if best < self.VISIBILITY_THRESHOLD and e["hit_flash"] == 0:
+                continue
+            ex = e["x"] * T + T // 2
+            ey = e["y"] * T + T // 2
+            half = T // 2 - 7
+            if e["hit_flash"] > 0:
+                fill, outline = "#ffffff", "#ff8a80"
+            else:
+                fill, outline = "#9c1a1a", "#ff5252"
+            c.create_rectangle(ex - half, ey - half, ex + half, ey + half,
+                               fill=fill, outline=outline, width=2)
+
+        # Sword swing visual
+        if self.swing_anim > 0:
+            x1 = self.px * T + T // 2
+            y1 = self.py * T + T // 2
+            if self.swing_target is not None:
+                # Hit: line to target + yellow splash circle
+                tx, ty = self.swing_target
+                x2 = tx * T + T // 2
+                y2 = ty * T + T // 2
+                c.create_line(x1, y1, x2, y2,
+                              fill="#FFFFFF", width=4)
+                r = self.SWORD_SPLASH * T
+                c.create_oval(x2 - r, y2 - r, x2 + r, y2 + r,
+                              outline="#FFE082", width=2)
+            else:
+                # Miss: dim grey arc around the player showing the range
+                r = self.SWORD_RANGE * T
+                c.create_oval(x1 - r, y1 - r, x1 + r, y1 + r,
+                              outline="#9e9e9e", width=2, dash=(3, 3))
+
+        # Bomb explosion visual: expanding blue ring around the player
+        if self.bomb_anim > 0:
+            cx = self.px * T + T // 2
+            cy = self.py * T + T // 2
+            progress = (self.BOMB_ANIM_FRAMES - self.bomb_anim) / self.BOMB_ANIM_FRAMES
+            r = self.BOMB_RADIUS * T * (0.35 + progress * 0.65)
+            c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                          outline="#42a5f5", width=4)
+            r2 = r * 0.7
+            c.create_oval(cx - r2, cy - r2, cx + r2, cy + r2,
+                          outline="#90caf9", width=2)
+
+        # Player (orange square) — flickers during invincibility frames
+        if self.iframes == 0 or (self.iframes // 2) % 2 == 0:
+            px = self.px * T + 5
+            py = self.py * T + 5
+            c.create_rectangle(px, py, px + T - 10, py + T - 10,
+                               fill="#FF8C00", outline="#FFB347", width=2)
+
+        # HUD bar — minimal: hearts and any carried soul dots.
+        hud_y = self.ROWS * T
+        c.create_rectangle(0, hud_y, self.COLS * T, hud_y + self.HUD_HEIGHT,
+                           fill="#0a0a14", outline="#1f1f38")
+        hearts = "♥" * self.hp + "♡" * (self.PLAYER_MAX_HP - self.hp)
+        c.create_text(
+            14, hud_y + self.HUD_HEIGHT // 2,
+            text=f"  {hearts}",
+            fill="#FF6B6B", font=("Helvetica", 16, "bold"), anchor="w")
+
+        # Carried soul dots — one fading blue circle per carried soul, drawn
+        # right of the hearts. Brightness scales with remaining TTL so the
+        # player can see how close each soul is to vanishing.
+        cy_dot = hud_y + self.HUD_HEIGHT // 2
+        x_dot = 100
+        for ttl in self.carried_souls:
+            ratio = max(0.0, min(1.0, ttl / self.SOUL_TTL_FRAMES))
+            r = int(20 + 80 * ratio)
+            g = int(60 + 120 * ratio)
+            b = int(120 + 135 * ratio)
+            color = f"#{r:02x}{g:02x}{b:02x}"
+            c.create_oval(x_dot - 7, cy_dot - 7, x_dot + 7, cy_dot + 7,
+                          fill=color, outline="")
+            x_dot += 20
+
+        # Damage-boost indicator: yellow diamond with "2x" while active
+        if self.damage_boost > 0:
+            x_dot += 6
+            size = 10
+            pts = [x_dot, cy_dot - size, x_dot + size, cy_dot,
+                   x_dot, cy_dot + size, x_dot - size, cy_dot]
+            c.create_polygon(pts, fill="#FFD700",
+                             outline="#FFF59D", width=2)
+            c.create_text(x_dot, cy_dot, text="2x",
+                          fill="#5A4400", font=("Helvetica", 8, "bold"))
+
+    @staticmethod
+    def _tile_color(intensity, is_wall, color="warm"):
+        """Tint a tile based on light intensity (0..1) and source color."""
+        intensity = max(0.0, min(1.0, intensity))
+        if color == "blue":
+            if is_wall:
+                r = int(15 + intensity * 50)
+                g = int(25 + intensity * 75)
+                b = int(50 + intensity * 150)
+            else:
+                r = int(5 + intensity * 30)
+                g = int(15 + intensity * 60)
+                b = int(30 + intensity * 130)
+        else:  # warm
+            if is_wall:
+                r = int(40 + intensity * 130)
+                g = int(20 + intensity * 65)
+                b = int(15 + intensity * 35)
+            else:
+                r = int(15 + intensity * 110)
+                g = int(8 + intensity * 55)
+                b = int(5 + intensity * 25)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _draw_flame(self, cx, cy, hue="warm", scale=1.0):
+        """Procedural flickering flame. Smaller layered ovals than before."""
+        c = self.canvas
+        if hue == "warm":
+            layers = [
+                (8, "#3a0a00"),
+                (6, "#7a1500"),
+                (4, "#cc3300"),
+                (3, "#ff6600"),
+                (2, "#ffa726"),
+                (1, "#fff176"),
+            ]
+        else:  # blue souls
+            layers = [
+                (8, "#001a3a"),
+                (6, "#00337a"),
+                (4, "#0066cc"),
+                (3, "#0099ff"),
+                (2, "#33ccff"),
+                (1, "#ccf2ff"),
+            ]
+        for radius, color in layers:
+            jx = random.randint(-2, 2)
+            jy = random.randint(-2, 1)
+            rj = random.uniform(-1.0, 1.0)
+            r = max(1, (radius + rj) * scale)
+            c.create_oval(cx - r + jx, cy - r + jy,
+                          cx + r + jx, cy + r + jy,
+                          fill=color, outline="")
+
+
 class ToyoSchedulerApp:
     def __init__(self, root):
         self.root = root
@@ -1487,7 +2170,7 @@ class ToyoSchedulerApp:
                    style="Big.TButton").pack(side=tk.LEFT, padx=3, ipadx=6, ipady=3)
         ttk.Button(toolbar, text="Reset to Defaults", command=self._reset_staff,
                    style="Big.TButton").pack(side=tk.RIGHT, padx=3, ipadx=6, ipady=3)
-        tk.Button(toolbar, text="❓  Flags Help",
+        tk.Button(toolbar, text="❓  Staff Help",
                   font=("Helvetica", 11, "bold"),
                   bg="#FFD54F", fg="black", activebackground="#FFC107",
                   relief="raised", bd=2, cursor="hand2",
@@ -1556,7 +2239,7 @@ class ToyoSchedulerApp:
             self._refresh_staff_tree()
 
     def _show_flags_help(self, parent):
-        """Popup explaining what each staff flag does."""
+        """Popup explaining what each staff flag and the Day Offs section do."""
         flags_doc = [
             ("fixed_schedule",
              "Staff member has a preset weekly schedule that overrides normal "
@@ -1580,19 +2263,44 @@ class ToyoSchedulerApp:
              "Staff member gets priority shift assignments based on their "
              "seniority score. Used for Olivia (host)."),
         ]
+        sections_doc = [
+            ("Day Offs",
+             "Recurring days a staff member doesn't work. Currently this "
+             "field is only enforced for fulltimers (staff with the "
+             "fixed_schedule flag) — Aaron, Chan, Dian, Leony. The scheduler "
+             "uses it as the off-day fallback for fulltimers when no "
+             "explicit availability is set, and the 'Set Default' button "
+             "on the Availability tab restores fulltimers to their off-days. "
+             "For non-fulltimer staff, the field is saved but ignored — "
+             "their availability comes entirely from the Availability tab."),
+        ]
 
         win = tk.Toplevel(parent)
-        win.title("Staff Flags — What They Do")
-        win.geometry("520x400")
+        win.title("Staff Help")
+        win.geometry("560x560")
         win.transient(parent)
         win.grab_set()
 
-        ttk.Label(win, text="Staff Flags",
+        ttk.Label(win, text="Staff Help",
                   font=("Helvetica", 14, "bold")).pack(pady=(12, 4))
 
-        body = tk.Frame(win, bg="white", bd=1, relief="sunken")
-        body.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        # Scrollable body so future entries don't overflow
+        outer = tk.Frame(win, bd=1, relief="sunken")
+        outer.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        canvas = tk.Canvas(outer, bg="white", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        body = tk.Frame(canvas, bg="white")
+        body.bind("<Configure>",
+                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
 
+        tk.Label(body, text="Staff Flags",
+                 font=("Helvetica", 12, "bold"),
+                 bg="white", fg="#333333", anchor="w").pack(
+            anchor="w", padx=10, pady=(8, 2))
         for name, desc in flags_doc:
             row = tk.Frame(body, bg="white")
             row.pack(fill=tk.X, padx=10, pady=6, anchor="w")
@@ -1600,16 +2308,115 @@ class ToyoSchedulerApp:
                      fg="#0066CC", bg="white", anchor="w").pack(anchor="w")
             tk.Label(row, text=desc, font=("Helvetica", 10),
                      bg="white", anchor="w", justify="left",
-                     wraplength=470).pack(anchor="w", padx=(12, 0))
+                     wraplength=500).pack(anchor="w", padx=(12, 0))
+
+        # Other dialog sections (e.g. Day Offs)
+        tk.Label(body, text="Other Sections",
+                 font=("Helvetica", 12, "bold"),
+                 bg="white", fg="#333333", anchor="w").pack(
+            anchor="w", padx=10, pady=(14, 2))
+        for name, desc in sections_doc:
+            row = tk.Frame(body, bg="white")
+            row.pack(fill=tk.X, padx=10, pady=6, anchor="w")
+            tk.Label(row, text=name, font=("Helvetica", 11, "bold"),
+                     fg="#0066CC", bg="white", anchor="w").pack(anchor="w")
+            tk.Label(row, text=desc, font=("Helvetica", 10),
+                     bg="white", anchor="w", justify="left",
+                     wraplength=500).pack(anchor="w", padx=(12, 0))
 
         ttk.Button(win, text="Close", command=win.destroy).pack(pady=10, ipadx=10)
+
+    def _absolute_emergency(self, parent):
+        """Easter egg flow: confirmation → 'Very well then...' → loading
+        screen → mini-game. Triggered by the ABSOLUTE EMERGENCY button in
+        the staff dialog."""
+        if not messagebox.askyesno(
+                "ABSOLUTE EMERGENCY",
+                "Are you sure?\n\n"
+                "Is a tornado heading towards Toyo?\n\n"
+                "Are you sure that we still need to remain open at this point?",
+                parent=parent):
+            return
+
+        # "Very well then..." popup — same shape/feel as a messagebox but
+        # with NO OK button. It auto-dismisses after ~1.5 seconds and then
+        # chains into the loading screen. Modal, so only one popup is on
+        # screen at a time (the askyesno already closed when Yes was hit).
+        notice = tk.Toplevel(parent)
+        notice.title("...")
+        notice.resizable(False, False)
+        notice.transient(parent)
+        notice.grab_set()
+        notice.protocol("WM_DELETE_WINDOW", lambda: None)
+        # Center over the parent
+        try:
+            parent.update_idletasks()
+            px = parent.winfo_rootx() + parent.winfo_width() // 2
+            py = parent.winfo_rooty() + parent.winfo_height() // 2
+            notice.geometry(f"260x110+{px - 130}+{py - 55}")
+        except tk.TclError:
+            notice.geometry("260x110")
+        ttk.Label(notice, text="Very well then...",
+                  font=("Helvetica", 12)).pack(expand=True, padx=20, pady=20)
+
+        def _continue():
+            try:
+                notice.destroy()
+            except tk.TclError:
+                pass
+            self._open_abyss_loader(parent)
+
+        notice.after(1500, _continue)
+        return
+
+    def _open_abyss_loader(self, parent):
+        # Black 8-bit-style loading screen with the animated abyss text
+        loading = tk.Toplevel(parent)
+        loading.title("")
+        loading.geometry("560x320")
+        loading.configure(bg="black")
+        loading.resizable(False, False)
+        loading.transient(parent)
+        loading.grab_set()
+        loading.overrideredirect(False)
+
+        label = tk.Label(loading, text="Entering the Abyss...",
+                         font=("Courier", 22, "bold"),
+                         fg="white", bg="black")
+        label.place(relx=0.5, rely=0.5, anchor="center")
+
+        # Trailing-ellipsis animation: alternates between 3 and 2 dots
+        # to match the "... .. ... .. ..." rhythm.
+        frames = ["...", " ..", "...", "..", "..."]
+        ABYSS_DURATION_MS = 5200   # original 3200 + 2000 longer
+        INTERVAL_MS = 380
+        state = {"i": 0, "elapsed": 0}
+
+        def tick():
+            if state["elapsed"] >= ABYSS_DURATION_MS:
+                try:
+                    loading.destroy()
+                except tk.TclError:
+                    pass
+                _ExplorerGame(parent)
+                return
+            f = frames[state["i"] % len(frames)]
+            label.config(text=f"Entering the Abyss{f}")
+            state["i"] += 1
+            state["elapsed"] += INTERVAL_MS
+            loading.after(INTERVAL_MS, tick)
+
+        tick()
 
     def _staff_dialog(self, existing):
         dlg = tk.Toplevel(self.root)
         dlg.title("Edit Staff" if existing else "Add Staff")
-        dlg.geometry("460x540")
+        dlg.geometry("520x680")
         dlg.transient(self.root)
-        dlg.grab_set()
+        # Defer the grab until Tk has actually mapped the window — calling
+        # grab_set() on an unmapped Toplevel raises "window not viewable"
+        # and unwinds the rest of this function, leaving a blank dialog.
+        dlg.after(50, lambda: dlg.grab_set() if dlg.winfo_exists() else None)
 
         row = 0
         ttk.Label(dlg, text="Name:").grid(row=row, column=0, padx=10, pady=5, sticky="w")
@@ -1640,7 +2447,7 @@ class ToyoSchedulerApp:
         row += 1
         ttk.Label(dlg, text="Flags:").grid(row=row, column=0, padx=10, pady=5, sticky="nw")
         help_btn = tk.Button(
-            dlg, text="❓  What do these flags mean?",
+            dlg, text="❓  Staff Help (flags + day offs)",
             font=("Helvetica", 10, "bold"),
             bg="#FFD54F", fg="black", activebackground="#FFC107",
             relief="raised", bd=2, cursor="hand2",
@@ -1660,6 +2467,18 @@ class ToyoSchedulerApp:
             flag_vars[flag] = var
 
         row += 1
+        # Easter egg: looks like a real "in case of crisis" override but
+        # actually triggers a confirmation flow into a tiny mini-game.
+        tk.Button(dlg, text="⚠  ABSOLUTE EMERGENCY  ⚠",
+                  font=("Helvetica", 10, "bold"),
+                  bg="#C62828", fg="white",
+                  activebackground="#8E0000", activeforeground="white",
+                  relief="raised", bd=2, cursor="hand2",
+                  command=lambda: self._absolute_emergency(dlg)).grid(
+            row=row, column=1, padx=10, pady=(8, 6), sticky="w",
+            ipadx=8, ipady=3)
+
+        row += 1
         ttk.Label(dlg, text="Fixed Schedule:").grid(row=row, column=0, padx=10, pady=5, sticky="w")
         fixed_var = tk.BooleanVar(value=existing.get("fixed_schedule", False) if existing else False)
         ttk.Checkbutton(dlg, variable=fixed_var).grid(row=row, column=1, padx=10, pady=5, sticky="w")
@@ -1668,6 +2487,22 @@ class ToyoSchedulerApp:
         ttk.Label(dlg, text="Active:").grid(row=row, column=0, padx=10, pady=5, sticky="w")
         active_var = tk.BooleanVar(value=existing["active"] if existing else True)
         ttk.Checkbutton(dlg, variable=active_var).grid(row=row, column=1, padx=10, pady=5, sticky="w")
+
+        # Day offs — recurring days this staff member doesn't work. Used as
+        # a default when generating availability and as a permanent off-day
+        # for fixed-schedule staff.
+        row += 1
+        ttk.Label(dlg, text="Day Offs:").grid(
+            row=row, column=0, padx=10, pady=(8, 2), sticky="nw")
+        offs_frame = ttk.Frame(dlg)
+        offs_frame.grid(row=row, column=1, padx=10, pady=(8, 2), sticky="w")
+        existing_offs = set(existing.get("default_off", []) if existing else [])
+        day_off_vars = {}
+        for di, day in enumerate(DAYS):
+            v = tk.BooleanVar(value=(day in existing_offs))
+            ttk.Checkbutton(offs_frame, text=day, variable=v).grid(
+                row=di // 4, column=di % 4, padx=4, pady=2, sticky="w")
+            day_off_vars[day] = v
 
         def save():
             name = name_var.get().strip()
@@ -1688,6 +2523,8 @@ class ToyoSchedulerApp:
             if pref == "none":
                 pref = None
 
+            day_offs = [d for d in DAYS if day_off_vars[d].get()]
+
             new_staff = {
                 "name": name,
                 "roles": roles,
@@ -1696,7 +2533,14 @@ class ToyoSchedulerApp:
                 "active": active_var.get(),
                 "flags": flags,
                 "role_preference": pref,
+                "default_off": day_offs,
             }
+            # Preserve default_availability (and any other unknown fields)
+            # from the existing record so they don't get wiped on edit.
+            if existing:
+                for k, v in existing.items():
+                    if k not in new_staff:
+                        new_staff[k] = v
 
             if existing:
                 # Update in place
@@ -1866,9 +2710,7 @@ class ToyoSchedulerApp:
         # Toolbar
         toolbar = ttk.Frame(frame)
         toolbar.pack(fill=tk.X, padx=8, pady=8)
-        ttk.Button(toolbar, text="Set All Available", command=self._set_all_available,
-                   style="Big.TButton").pack(side=tk.LEFT, padx=3, ipadx=6, ipady=3)
-        ttk.Button(toolbar, text="Clear All", command=self._clear_availability,
+        ttk.Button(toolbar, text="Set Default", command=self._set_default_availability,
                    style="Big.TButton").pack(side=tk.LEFT, padx=3, ipadx=6, ipady=3)
         if HAS_OCR:
             ttk.Button(toolbar, text="Import from Photo", command=self._import_from_photo,
@@ -2330,19 +3172,15 @@ class ToyoSchedulerApp:
         # 4. Dinner Servers
         row = add_shift_section(row, "SERVER — DINNER", server_names, "server", "night", "darkblue")
 
-    def _set_all_available(self):
-        if not messagebox.askyesno("Set All Available", "Are you sure you want to set all staff as available?"):
-            return
-        for staff in self.data.staff:
-            if not staff["active"] or "manager" in staff["roles"]:
-                continue
-            name = staff["name"]
-            for day in DAYS:
-                self.data.availability.setdefault(name, {})[day] = "both"
-        self._build_availability_grid()
-
-    def _clear_availability(self):
-        if not messagebox.askyesno("Clear All", "Are you sure you want to clear all availability?"):
+    def _set_default_availability(self):
+        """Reset everyone to off, then restore the fulltimers (fixed-schedule
+        staff) to their default availability. Used as a clean starting point
+        for filling in the rest of the week."""
+        if not messagebox.askyesno(
+                "Set Default",
+                "Are you sure you want to clear everyone and restore the "
+                "fulltimers' default schedules? Any unsaved availability "
+                "edits will be lost."):
             return
         for staff in self.data.staff:
             if not staff["active"] or "manager" in staff["roles"]:
