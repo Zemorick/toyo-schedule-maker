@@ -1485,6 +1485,7 @@ class _ExplorerGame:
     POWERUP_TTL_FRAMES = 167      # ~15 seconds before a dropped power-up vanishes
     DAMAGE_BOOST_FRAMES = 167     # ~15 seconds of 2x sword damage
     DAMAGE_BOOST_FRAMES_2X = 334  # ~30 seconds while two boosts are stacked
+    DAMAGE_BOOST_FRAMES_BONUS = 56  # ~5 seconds added on overflow pickups
     DAMAGE_BOOST_MAX_STACKS = 2   # cap on simultaneous damage-boost stacks
     BOMB_RADIUS = 4.0             # tiles affected by the soul-bomb cheat
     BOMB_ANIM_FRAMES = 6
@@ -1614,16 +1615,27 @@ class _ExplorerGame:
         for p in self.power_ups:
             if p["x"] == nx and p["y"] == ny:
                 if p["kind"] == "damage":
-                    # Stack up to DAMAGE_BOOST_MAX_STACKS. Each pickup
-                    # refreshes the timer. At 2 stacks the timer is reset
-                    # AND extended by another 15s window (total 30s),
-                    # rewarding the rare double pickup.
+                    # Stack up to DAMAGE_BOOST_MAX_STACKS. At 2 stacks the
+                    # timer is reset AND extended by another 15s window
+                    # (total 30s), rewarding the double pickup.
                     if self.damage_stacks < self.DAMAGE_BOOST_MAX_STACKS:
                         self.damage_stacks += 1
-                    if self.damage_stacks >= 2:
-                        self.damage_boost = self.DAMAGE_BOOST_FRAMES_2X
+                        if self.damage_stacks >= 2:
+                            self.damage_boost = self.DAMAGE_BOOST_FRAMES_2X
+                        else:
+                            self.damage_boost = self.DAMAGE_BOOST_FRAMES
                     else:
-                        self.damage_boost = self.DAMAGE_BOOST_FRAMES
+                        # Already at max stacks: refresh to 15s if the
+                        # remaining timer is below that threshold,
+                        # otherwise add a small +5s bonus on top, capped
+                        # at the 30s 2x-stack ceiling.
+                        if self.damage_boost < self.DAMAGE_BOOST_FRAMES:
+                            self.damage_boost = self.DAMAGE_BOOST_FRAMES
+                        else:
+                            self.damage_boost = min(
+                                self.DAMAGE_BOOST_FRAMES_2X,
+                                self.damage_boost + self.DAMAGE_BOOST_FRAMES_BONUS,
+                            )
                     continue
                 elif p["kind"] == "heart":
                     if self.hp < self.PLAYER_MAX_HP:
