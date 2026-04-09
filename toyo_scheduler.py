@@ -25,11 +25,13 @@ except ImportError:
     FPDF = None  # PDF export disabled but app still works
 
 try:
-    import easyocr
     import cv2
     import numpy as np
     from difflib import SequenceMatcher
-    HAS_OCR = True
+    # OCR runs in a separate Python 3.12 venv via ocr_worker.py subprocess
+    _OCR_VENV_PYTHON = Path.home() / ".toyo_scheduler" / "ocr_venv" / "bin" / "python3"
+    _OCR_WORKER = Path(__file__).parent / "ocr_worker.py"
+    HAS_OCR = _OCR_VENV_PYTHON.exists() and _OCR_WORKER.exists()
 except ImportError:
     HAS_OCR = False
 
@@ -40,9 +42,9 @@ DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 SHIFTS = ["morning", "mid", "night"]
 
 MORNING_SIDEWORK = ["A", "B", "C", "D"]
-MORNING_EXTRA_ORDER = ["A", "C", "D"]  # doubles in this order
+MORNING_EXTRA_ORDER = ["C", "A", "B"]  # doubles in this order
 NIGHT_SIDEWORK = ["A", "B", "C", "D", "E", "F", "G", "H"]
-NIGHT_EXTRA_ORDER = ["F", "H"]  # doubles in this order
+NIGHT_EXTRA_ORDER = ["F", "H", "G", "E", "D", "C", "B", "A"]  # doubles in this order
 
 LUNCH_SERVER_TIME = "(10:15-2:15)"
 LUNCH_HOST_TIMES = ["(10:15-4:15)", "(10:15-2:15)"]
@@ -76,10 +78,10 @@ DEFAULT_STAFF = [
     {"name": "Andy", "roles": ["server"], "seniority": 6, "fixed_schedule": False,
      "active": True, "flags": ["fill_in"], "role_preference": "server",
      "preferred_off": ["TUE", "WED", "THU"]},
-    {"name": "Winnie", "roles": ["server"], "seniority": 3, "fixed_schedule": False,
-     "active": True, "flags": ["emergency_only"], "role_preference": "server"},
+    {"name": "Winnie", "roles": ["server", "host"], "seniority": 3, "fixed_schedule": False,
+     "active": True, "flags": ["emergency_only"], "role_preference": None},
     {"name": "Cindy", "roles": ["server"], "seniority": 3, "fixed_schedule": False,
-     "active": False, "flags": ["fill_in"], "role_preference": "server"},
+     "active": True, "flags": ["fill_in"], "role_preference": "server"},
     {"name": "Maddie", "roles": ["server"], "seniority": 5, "fixed_schedule": False,
      "active": True, "flags": [], "role_preference": "server"},
     {"name": "Owen", "roles": ["server"], "seniority": 5, "fixed_schedule": False,
@@ -314,11 +316,14 @@ class ScheduleGenerator:
         # Step 5: Place remaining servers
         self._place_servers(avail, config)
 
-        # Step 6: Assign sidework letters
+        # Step 6: Balance hibachi (ensure ~2 per server per week)
+        self._balance_hibachi(config)
+
+        # Step 7: Assign sidework letters (after hibachi so hibachi gets last letters)
         self._assign_sidework_letters()
 
-        # Step 7: Balance hibachi (ensure ~2 per server per week)
-        self._balance_hibachi(config)
+        # Step 8: Check shortages (after all placement is done)
+        self._check_shortages(config)
 
         return self.schedule, self.warnings
 
@@ -338,10 +343,18 @@ class ScheduleGenerator:
             return True
         return False
 
-    def _is_assigned(self, name, day):
+    def _is_assigned(self, name, day, shift=None):
+        """Check if staff is already assigned. If shift is given, only check that shift."""
         s = self.schedule[day]
-        for key in ["lunch_servers", "lunch_hosts", "hibachi_lunch_servers", "mid_servers",
-                     "dinner_servers", "dinner_hosts", "hibachi_servers"]:
+        lunch_keys = ["lunch_servers", "lunch_hosts", "hibachi_lunch_servers"]
+        dinner_keys = ["dinner_servers", "dinner_hosts", "hibachi_servers"]
+        if shift == "morning":
+            keys = lunch_keys
+        elif shift == "night":
+            keys = dinner_keys
+        else:
+            keys = lunch_keys + ["mid_servers"] + dinner_keys
+        for key in keys:
             if name in s[key]:
                 return True
         return False
@@ -403,7 +416,7 @@ class ScheduleGenerator:
             needed = staffing["lunch_hosts"]
             candidates = [h for h in hosts
                           if self._can_work(h["name"], day, "morning")
-                          and not self._is_assigned(h["name"], day)]
+                          and not self._is_assigned(h["name"], day, "morning")]
             # Sort: fewer shifts first (balance), then seniority for ties
             candidates.sort(key=lambda h: (self._get_shift_count(h["name"]), -h["seniority"]))
             for h in candidates[:needed - len(self.schedule[day]["lunch_hosts"])]:
@@ -418,12 +431,12 @@ class ScheduleGenerator:
                 # Candidates who can close (excludes no_closing flag)
                 can_close = [h for h in hosts
                              if self._can_work(h["name"], day, "night")
-                             and not self._is_assigned(h["name"], day)
+                             and not self._is_assigned(h["name"], day, "night")
                              and "no_closing" not in (self.data.get_staff_by_name(h["name"]) or {}).get("flags", [])]
                 # Candidates who can't close (Maria etc.) — only for non-closing slots
                 no_close = [h for h in hosts
                             if self._can_work(h["name"], day, "night")
-                            and not self._is_assigned(h["name"], day)
+                            and not self._is_assigned(h["name"], day, "night")
                             and "no_closing" in (self.data.get_staff_by_name(h["name"]) or {}).get("flags", [])]
 
                 # Sort non-closing by shift balance
@@ -475,7 +488,7 @@ class ScheduleGenerator:
                             and not s["fixed_schedule"]
                             and "emergency_only" not in s["flags"]
                             and self._can_work(s["name"], day, shift_type)
-                            and not self._is_assigned(s["name"], day)]
+                            and not self._is_assigned(s["name"], day, shift_type)]
                     dual.sort(key=lambda s: self._get_shift_count(s["name"]))
                     for s in dual[:needed - current]:
                         self.schedule[day][shift_key].append(s["name"])
@@ -486,7 +499,8 @@ class ScheduleGenerator:
                        if not s["fixed_schedule"]
                        and "always_hibachi" not in s["flags"]
                        and "fill_in" not in s["flags"]
-                       and "emergency_only" not in s["flags"]]
+                       and "emergency_only" not in s["flags"]
+                       and s.get("role_preference") != "host"]
 
         fill_ins = [s for s in self.data.get_active_staff("server")
                     if "fill_in" in s["flags"]]
@@ -500,13 +514,13 @@ class ScheduleGenerator:
 
             staffing = config["staffing"][day]
 
-            # Lunch servers
+            # Lunch servers (hibachi is picked from this pool, not additional)
             needed = staffing["lunch_servers"]
             current = len(self.schedule[day]["lunch_servers"])
             if current < needed:
                 candidates = [s for s in all_servers
                               if self._can_work(s["name"], day, "morning")
-                              and not self._is_assigned(s["name"], day)]
+                              and not self._is_assigned(s["name"], day, "morning")]
                 # Deprioritize staff who prefer this day off
                 def server_sort_key(s):
                     preferred_off = s.get("preferred_off", [])
@@ -526,7 +540,7 @@ class ScheduleGenerator:
                         and "fill_in" not in s["flags"]
                         and "emergency_only" not in s["flags"]
                         and self._can_work(s["name"], day, "morning")
-                        and not self._is_assigned(s["name"], day)]
+                        and not self._is_assigned(s["name"], day, "morning")]
                 dual.sort(key=lambda s: self._get_shift_count(s["name"]))
                 for s in dual[:needed - current]:
                     self.schedule[day]["lunch_servers"].append(s["name"])
@@ -537,19 +551,19 @@ class ScheduleGenerator:
             if current < needed:
                 fi = [s for s in fill_ins
                       if self._can_work(s["name"], day, "morning")
-                      and not self._is_assigned(s["name"], day)]
+                      and not self._is_assigned(s["name"], day, "morning")]
                 fi.sort(key=fill_in_sort_key)
                 for s in fi[:needed - current]:
                     self.schedule[day]["lunch_servers"].append(s["name"])
                     self._add_shift(s["name"])
 
-            # Dinner servers
+            # Dinner servers (hibachi is picked from this pool, not additional)
             needed = staffing["dinner_servers"]
             current = len(self.schedule[day]["dinner_servers"])
             if current < needed:
                 candidates = [s for s in all_servers
                               if self._can_work(s["name"], day, "night")
-                              and not self._is_assigned(s["name"], day)]
+                              and not self._is_assigned(s["name"], day, "night")]
                 def dinner_sort_key(s):
                     preferred_off = s.get("preferred_off", [])
                     off_penalty = 5 if day in preferred_off else 0
@@ -568,7 +582,7 @@ class ScheduleGenerator:
                         and "fill_in" not in s["flags"]
                         and "emergency_only" not in s["flags"]
                         and self._can_work(s["name"], day, "night")
-                        and not self._is_assigned(s["name"], day)]
+                        and not self._is_assigned(s["name"], day, "night")]
                 dual.sort(key=lambda s: self._get_shift_count(s["name"]))
                 for s in dual[:needed - current]:
                     self.schedule[day]["dinner_servers"].append(s["name"])
@@ -579,7 +593,7 @@ class ScheduleGenerator:
             if current < needed:
                 fi = [s for s in fill_ins
                       if self._can_work(s["name"], day, "night")
-                      and not self._is_assigned(s["name"], day)]
+                      and not self._is_assigned(s["name"], day, "night")]
                 fi.sort(key=fill_in_sort_key)
                 for s in fi[:needed - current]:
                     self.schedule[day]["dinner_servers"].append(s["name"])
@@ -590,21 +604,29 @@ class ScheduleGenerator:
             # Mid servers are selected by manager later, but we can suggest
             # For now leave empty - manager picks in the GUI
 
-            # Check shortages
+
+    def _check_shortages(self, config):
+        """Check for staffing shortages after all placement is done."""
+        for day in DAYS:
+            staffing = config["staffing"][day]
             for key, label in [("lunch_servers", "Lunch Servers"),
                                ("dinner_servers", "Dinner Servers"),
                                ("lunch_hosts", "Lunch Hosts"),
                                ("dinner_hosts", "Dinner Hosts")]:
-                needed_key = key
-                if needed_key == "lunch_hosts":
+                if key == "lunch_hosts":
                     n = staffing["lunch_hosts"]
-                elif needed_key == "dinner_hosts":
+                elif key == "dinner_hosts":
                     n = staffing["dinner_hosts"]
-                elif needed_key == "lunch_servers":
+                elif key == "lunch_servers":
                     n = staffing["lunch_servers"]
                 else:
                     n = staffing["dinner_servers"]
                 actual = len(self.schedule[day][key])
+                # Include hibachi servers in the count
+                if key == "dinner_servers":
+                    actual += len(self.schedule[day]["hibachi_servers"])
+                elif key == "lunch_servers":
+                    actual += len(self.schedule[day]["hibachi_lunch_servers"])
                 if actual < n:
                     self.warnings.append(
                         f"{day}: Need {n} {label} but only found {actual}")
@@ -634,35 +656,45 @@ class ScheduleGenerator:
 
         for day in DAYS:
             # --- Morning servers get A-D ---
+            # Build full letter list for total people, then split: regulars first, hibachi last
             servers = list(self.schedule[day]["lunch_servers"])
+            hibachi_lunch = list(self.schedule[day]["hibachi_lunch_servers"])
+            total = len(servers) + len(hibachi_lunch)
+
+            # Build enough letters for everyone: A-D first, then doubles in order
             letters = list(MORNING_SIDEWORK)
-            if len(servers) > len(letters):
+            if total > len(letters):
                 for extra_letter in MORNING_EXTRA_ORDER:
                     letters.append(extra_letter)
-                    if len(letters) >= len(servers):
+                    if len(letters) >= total:
                         break
 
             self.schedule[day]["lunch_server_letters"] = {}
 
-            # Determine morning A holder
+            # Determine morning A holder (from regular servers only)
             if day in ("FRI", "SAT"):
                 morning_a = self._find_a_holder(servers, MORNING_A_PRIORITY_FRISATAM)
             else:
                 morning_a = self._find_a_holder(servers, MORNING_A_PRIORITY_DEFAULT)
 
             if morning_a:
-                ordered = [morning_a] + [n for n in servers if n != morning_a]
+                ordered_regular = [morning_a] + [n for n in servers if n != morning_a]
             else:
-                ordered = servers
+                ordered_regular = servers
 
-            for i, name in enumerate(ordered):
-                if i < len(letters):
-                    self.schedule[day]["lunch_server_letters"][name] = letters[i]
-                else:
-                    self.schedule[day]["lunch_server_letters"][name] = letters[-1]
+            # Regular servers get the first letters, hibachi get the last
+            for i, name in enumerate(ordered_regular):
+                self.schedule[day]["lunch_server_letters"][name] = letters[i]
+
+            for i, name in enumerate(hibachi_lunch):
+                idx = len(ordered_regular) + i
+                self.schedule[day]["lunch_server_letters"][name] = letters[idx] if idx < len(letters) else letters[-1]
 
             # --- Night servers get A-H ---
-            all_night = self.schedule[day]["dinner_servers"] + self.schedule[day]["hibachi_servers"]
+            # Regular servers first, hibachi last (hibachi gets last letters)
+            dinner_regular = list(self.schedule[day]["dinner_servers"])
+            dinner_hibachi = list(self.schedule[day]["hibachi_servers"])
+            all_night = dinner_regular + dinner_hibachi
             letters = list(NIGHT_SIDEWORK)
             if len(all_night) > len(letters):
                 for extra_letter in NIGHT_EXTRA_ORDER:
@@ -672,26 +704,35 @@ class ScheduleGenerator:
 
             self.schedule[day]["dinner_server_letters"] = {}
 
-            night_a = self._find_a_holder(all_night, NIGHT_A_PRIORITY)
+            night_a = self._find_a_holder(dinner_regular, NIGHT_A_PRIORITY)
 
             if night_a:
-                ordered_night = [night_a] + [n for n in all_night if n != night_a]
+                ordered_night = [night_a] + [n for n in dinner_regular if n != night_a]
             else:
-                ordered_night = all_night
+                ordered_night = dinner_regular
 
+            # Build full letter list for total count
+            total_night = len(ordered_night) + len(dinner_hibachi)
+            if total_night > len(letters):
+                for extra_letter in NIGHT_EXTRA_ORDER:
+                    letters.append(extra_letter)
+                    if len(letters) >= total_night:
+                        break
+
+            # Regular servers get the first letters, hibachi get the last
             for i, name in enumerate(ordered_night):
-                if i < len(letters):
-                    self.schedule[day]["dinner_server_letters"][name] = letters[i]
-                else:
-                    self.schedule[day]["dinner_server_letters"][name] = letters[-1]
+                self.schedule[day]["dinner_server_letters"][name] = letters[i]
+
+            for i, name in enumerate(dinner_hibachi):
+                idx = len(ordered_night) + i
+                self.schedule[day]["dinner_server_letters"][name] = letters[idx] if idx < len(letters) else letters[-1]
+
 
     def _balance_hibachi(self, config):
         # Each server should get ~2 hibachi shifts per week
         # Will is excluded (always hibachi)
         all_servers = [s["name"] for s in self.data.get_active_staff("server")
-                       if not s["fixed_schedule"]
-                       and "always_hibachi" not in s["flags"]
-                       and "fill_in" not in s["flags"]
+                       if "always_hibachi" not in s["flags"]
                        and "emergency_only" not in s["flags"]
                        and s["active"]]
 
@@ -703,14 +744,26 @@ class ScheduleGenerator:
         for day in DAYS:
             staffing = config["staffing"][day]
             needed = staffing.get("hibachi_lunch", 0)
+            already = len(self.schedule[day]["hibachi_lunch_servers"])
+            needed = needed - already
             if needed <= 0:
                 continue
             lunch = self.schedule[day]["lunch_servers"][:]
             lunch_eligible = [n for n in lunch if n in all_servers
                               and self.hibachi_counts.get(n, 0) < 2]
-            lunch_eligible.sort(key=lambda n: self.hibachi_counts.get(n, 0))
+            # Sort: fewest hibachi first, then lowest seniority first (so senior staff stay on regular sidework)
+            lunch_eligible.sort(key=lambda n: (
+                self.hibachi_counts.get(n, 0),
+                -(self.data.get_staff_by_name(n) or {}).get("seniority", 0)))
 
             picked = lunch_eligible[:needed]
+            # Fallback: if not enough with < 2 count, allow anyone
+            if len(picked) < needed:
+                remaining = needed - len(picked)
+                picked_names = set(n for n in picked)
+                fallback = [n for n in lunch if n in all_servers and n not in picked_names]
+                fallback.sort(key=lambda n: self.hibachi_counts.get(n, 0))
+                picked.extend(fallback[:remaining])
             for name in picked:
                 self.hibachi_counts[name] = self.hibachi_counts.get(name, 0) + 1
                 if name in self.schedule[day]["lunch_servers"]:
@@ -721,14 +774,26 @@ class ScheduleGenerator:
         for day in DAYS:
             staffing = config["staffing"][day]
             needed = staffing.get("hibachi_dinner", 0)
+            already = len(self.schedule[day]["hibachi_servers"])
+            needed = needed - already
             if needed <= 0:
                 continue
             dinner = self.schedule[day]["dinner_servers"][:]
             dinner_eligible = [n for n in dinner if n in all_servers
                                and self.hibachi_counts.get(n, 0) < 2]
-            dinner_eligible.sort(key=lambda n: self.hibachi_counts.get(n, 0))
+            # Sort: fewest hibachi first, then lowest seniority first
+            dinner_eligible.sort(key=lambda n: (
+                self.hibachi_counts.get(n, 0),
+                -(self.data.get_staff_by_name(n) or {}).get("seniority", 0)))
 
             picked = dinner_eligible[:needed]
+            # Fallback: if not enough with < 2 count, allow anyone
+            if len(picked) < needed:
+                remaining = needed - len(picked)
+                picked_names = set(n for n in picked)
+                fallback = [n for n in dinner if n in all_servers and n not in picked_names]
+                fallback.sort(key=lambda n: self.hibachi_counts.get(n, 0))
+                picked.extend(fallback[:remaining])
             for name in picked:
                 self.hibachi_counts[name] = self.hibachi_counts.get(name, 0) + 1
                 if name in self.schedule[day]["dinner_servers"]:
@@ -1040,8 +1105,10 @@ class PDFExporter:
             for day in DAYS:
                 hibachi_lunch = self.schedule[day]["hibachi_lunch_servers"]
                 servers = self.schedule[day]["lunch_servers"]
-                combined = hibachi_lunch + servers
                 letters = self.schedule[day].get("lunch_server_letters", {})
+                hib_set = set(hibachi_lunch)
+                combined = servers + hibachi_lunch
+                combined.sort(key=lambda n: (letters.get(n, "Z"), 1 if n in hib_set else 0))
                 mids = self.schedule[day].get("mid_servers", [])
                 if si < len(combined):
                     name = combined[si]
@@ -1057,17 +1124,42 @@ class PDFExporter:
         for day in DAYS:
             row_mgr.append(self.schedule[day]["lunch_manager"])
         y = draw_row(y, row_mgr, bold=True, size=6)
+        # Lunch manager time
+        row_mgr_t = [""] + [LUNCH_MANAGER_TIME] * 7
+        y = draw_row(y, row_mgr_t, size=5)
 
-        # Lunch hosts
+        # Lunch hosts — name row then time row for each hostess slot
         max_lh = max(len(self.schedule[d]["lunch_hosts"]) for d in DAYS) if DAYS else 0
         for hi in range(max(max_lh, 1)):
+            # Name row
             row = [f"Hostess {hi+1}" if hi < 3 else ""]
             for day in DAYS:
                 hosts = self.schedule[day]["lunch_hosts"]
                 row.append(hosts[hi] if hi < len(hosts) else "")
             y = draw_row(y, row, size=6)
+            # Time row
+            row_t = [""]
+            for day in DAYS:
+                hosts = self.schedule[day]["lunch_hosts"]
+                if hi < len(hosts) and hi < len(LUNCH_HOST_TIMES):
+                    row_t.append(LUNCH_HOST_TIMES[hi])
+                else:
+                    row_t.append("")
+            y = draw_row(y, row_t, size=5)
 
-        y += 2  # spacer
+        # Transition time row
+        row_trans = [""]
+        time_row_20 = {
+            "MON": "(10:15-2:15)", "TUE": "(10:15-4:15)",
+            "WED": "(4:00-8:00)", "THU": "(10:15-2:15)",
+            "FRI": "(10:15-3:15)", "SAT": "(10:15-2:15)",
+            "SUN": "(11:30-3:15)",
+        }
+        for day in DAYS:
+            row_trans.append(time_row_20.get(day, ""))
+        y = draw_row(y, row_trans, size=5)
+
+        y += 1  # spacer
 
         # DINNER SECTION
         y = draw_row(y, ["DINNER SERVERS", "", "", "", "", "", "", ""], bold=True, size=7)
@@ -1080,8 +1172,10 @@ class PDFExporter:
             for day in DAYS:
                 hibachi = self.schedule[day]["hibachi_servers"]
                 servers = self.schedule[day]["dinner_servers"]
-                combined = hibachi + servers
                 letters = self.schedule[day].get("dinner_server_letters", {})
+                hib_set = set(hibachi)
+                combined = servers + hibachi
+                combined.sort(key=lambda n: (letters.get(n, "Z"), 1 if n in hib_set else 0))
                 mids = self.schedule[day].get("mid_servers", [])
                 if si < len(combined):
                     name = combined[si]
@@ -1092,21 +1186,43 @@ class PDFExporter:
                     row.append("")
             y = draw_row(y, row, size=6)
 
-        # Dinner hosts
+        # Dinner hosts — name row then time row for each hostess slot
         y += 1
         max_dh = max(len(self.schedule[d]["dinner_hosts"]) for d in DAYS) if DAYS else 0
         for hi in range(max(max_dh, 1)):
+            # Name row
             row = [f"Hostess {hi+1}" if hi < 3 else ""]
             for day in DAYS:
                 hosts = self.schedule[day]["dinner_hosts"]
                 row.append(hosts[hi] if hi < len(hosts) else "")
             y = draw_row(y, row, size=6)
+            # Time row
+            row_t = [""]
+            for di, day in enumerate(DAYS):
+                hosts = self.schedule[day]["dinner_hosts"]
+                if hi < len(hosts):
+                    if di >= 5:  # SAT, SUN
+                        times = DINNER_HOST_TIMES_WEEKEND if day != "SUN" else DINNER_HOST_TIMES_SUNDAY
+                    elif di == 4:  # FRI
+                        times = DINNER_HOST_TIMES_FRIDAY
+                    else:
+                        times = DINNER_HOST_TIMES_WEEKDAY
+                    row_t.append(times[hi] if hi < len(times) else "")
+                else:
+                    row_t.append("")
+            y = draw_row(y, row_t, size=5)
 
         # Dinner manager
         row_mgr = ["Dinner Manager"]
         for day in DAYS:
             row_mgr.append(self.schedule[day]["dinner_manager"])
         y = draw_row(y, row_mgr, bold=True, size=6)
+        # Dinner manager time
+        row_mgr_t = [""]
+        for di, day in enumerate(DAYS):
+            t = DINNER_MANAGER_TIME_WEEKEND if di >= 4 else DINNER_MANAGER_TIME_WEEKDAY
+            row_mgr_t.append(t)
+        y = draw_row(y, row_mgr_t, size=5)
 
         # Legend
         y += 3
@@ -1441,11 +1557,9 @@ class ToyoSchedulerApp:
                             saved_val = "off" if day in default_off else "both"
                     self.avail_vars[name][day] = tk.StringVar(value=saved_val)
 
-        # Build name lists for dropdowns
-        servers = [s for s in active if "server" in s["roles"] and "manager" not in s["roles"]
-                   and "emergency_only" not in s.get("flags", [])]
-        hosts = [s for s in active if "host" in s["roles"] and "manager" not in s["roles"]
-                 and "emergency_only" not in s.get("flags", [])]
+        # Build name lists for dropdowns (include emergency/fill-in for manual assignment)
+        servers = [s for s in active if "server" in s["roles"] and "manager" not in s["roles"]]
+        hosts = [s for s in active if "host" in s["roles"] and "manager" not in s["roles"]]
         servers.sort(key=lambda s: s["name"])
         hosts.sort(key=lambda s: s["name"])
 
@@ -1475,6 +1589,10 @@ class ToyoSchedulerApp:
         ]:
             for staff in staff_list:
                 name = staff["name"]
+                # Dual-role staff: only show in their preferred role section
+                is_dual = "server" in staff["roles"] and "host" in staff["roles"]
+                if is_dual and staff.get("role_preference") and staff["role_preference"] != role_key:
+                    continue
                 if name not in self.avail_vars:
                     continue
                 display = find_display_name(name, name_list)
@@ -1653,30 +1771,39 @@ class ToyoSchedulerApp:
                     lb.bind("<Key>", on_key)
                     lb.bind("<Down>", on_arrow)
                     lb.bind("<Up>", on_arrow)
+                    lb.bind("<Escape>", lambda e: popup.destroy())
                     popup.update_idletasks()
                     lb.focus_force()
-                    def close_if_outside(event):
-                        try:
-                            w = event.widget
-                            if w != lb and w != popup and not str(w).startswith(str(popup)):
-                                popup.destroy()
-                        except tk.TclError:
-                            pass
-                    popup.bind("<FocusOut>", lambda e: popup.after(100, lambda: close_popup_safe(popup)))
 
-                    def close_popup_safe(p):
-                        try:
-                            if not p.focus_get() or not str(p.focus_get()).startswith(str(p)):
-                                p.destroy()
-                        except (tk.TclError, AttributeError):
-                            pass
+                    # Close popup when clicking anywhere outside it
+                    def _make_close_handler(p, toplevel):
+                        def handler(event):
+                            try:
+                                p_str = str(p)
+                                w_str = str(event.widget)
+                                if w_str != p_str and not w_str.startswith(p_str + "."):
+                                    p.destroy()
+                            except tk.TclError:
+                                pass
+                        def cleanup(event):
+                            if event.widget == p:
+                                try:
+                                    toplevel.unbind("<Button-1>")
+                                except tk.TclError:
+                                    pass
+                        return handler, cleanup
+                    _toplevel = parent.winfo_toplevel()
+                    _click_handler, _destroy_handler = _make_close_handler(popup, _toplevel)
+                    _toplevel.bind("<Button-1>", _click_handler, add="+")
+                    popup.bind("<Destroy>", _destroy_handler)
 
                 add_btn.bind("<Button-1>", open_popup)
 
             refresh_cell()
             return cell
 
-        def add_section(row, title, name_list, role_key, staff_list):
+        def add_shift_section(row, title, name_list, role_key, shift, color):
+            """Add a single shift-role section (e.g. Host Morning, Lunch Server)."""
             # Section header
             ttk.Label(self.avail_frame, text=title,
                       font=("Helvetica", 12, "bold"), foreground="navy").grid(
@@ -1690,28 +1817,15 @@ class ToyoSchedulerApp:
                           width=16).grid(row=row, column=di + 1, padx=2, pady=3)
             row += 1
 
-            # --- Morning ---
-            ttk.Label(self.avail_frame, text="Morning",
-                      font=("Helvetica", 10, "bold"), foreground="darkorange").grid(
+            # Staff cells
+            ttk.Label(self.avail_frame, text=shift.capitalize(),
+                      font=("Helvetica", 10, "bold"), foreground=color).grid(
                 row=row, column=0, padx=5, pady=(5, 2), sticky="nw")
             for di, day in enumerate(DAYS):
-                key = (role_key, "morning", day)
+                key = (role_key, shift, day)
                 names = self._slot_names.get(key, [])
                 cell = make_staff_cell(self.avail_frame, names, name_list,
-                                       role_key, "morning", day, row, di + 1)
-                self._cell_widgets[key] = cell
-                self._slot_names[key] = names
-            row += 1
-
-            # --- Night ---
-            ttk.Label(self.avail_frame, text="Night",
-                      font=("Helvetica", 10, "bold"), foreground="darkblue").grid(
-                row=row, column=0, padx=5, pady=(8, 2), sticky="nw")
-            for di, day in enumerate(DAYS):
-                key = (role_key, "night", day)
-                names = self._slot_names.get(key, [])
-                cell = make_staff_cell(self.avail_frame, names, name_list,
-                                       role_key, "night", day, row, di + 1)
+                                       role_key, shift, day, row, di + 1)
                 self._cell_widgets[key] = cell
                 self._slot_names[key] = names
             row += 1
@@ -1720,17 +1834,34 @@ class ToyoSchedulerApp:
 
         row = 0
 
-        # --- Servers section ---
-        row = add_section(row, "SERVERS", server_names, "server", servers)
+        # Layout matches the sign-up sheet order:
+        # 1. Host Morning
+        row = add_shift_section(row, "HOST — MORNING", host_names, "host", "morning", "darkorange")
 
         ttk.Separator(self.avail_frame, orient="horizontal").grid(
             row=row, column=0, columnspan=8, sticky="ew", pady=8)
         row += 1
 
-        # --- Hosts section ---
-        row = add_section(row, "HOSTS", host_names, "host", hosts)
+        # 2. Lunch Servers
+        row = add_shift_section(row, "SERVER — LUNCH", server_names, "server", "morning", "darkorange")
+
+        ttk.Separator(self.avail_frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=8, sticky="ew", pady=8)
+        row += 1
+
+        # 3. Host Night
+        row = add_shift_section(row, "HOST — DINNER", host_names, "host", "night", "darkblue")
+
+        ttk.Separator(self.avail_frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=8, sticky="ew", pady=8)
+        row += 1
+
+        # 4. Dinner Servers
+        row = add_shift_section(row, "SERVER — DINNER", server_names, "server", "night", "darkblue")
 
     def _set_all_available(self):
+        if not messagebox.askyesno("Set All Available", "Are you sure you want to set all staff as available?"):
+            return
         for staff in self.data.staff:
             if not staff["active"] or "manager" in staff["roles"]:
                 continue
@@ -1740,6 +1871,8 @@ class ToyoSchedulerApp:
         self._build_availability_grid()
 
     def _clear_availability(self):
+        if not messagebox.askyesno("Clear All", "Are you sure you want to clear all availability?"):
+            return
         for staff in self.data.staff:
             if not staff["active"] or "manager" in staff["roles"]:
                 continue
@@ -1852,6 +1985,7 @@ class ToyoSchedulerApp:
         "catiegrace": "Catie Grey", "catiegray": "Catie Grey",
         "catie grey": "Catie Grey", "catiegrey": "Catie Grey",
         "catie gvey": "Catie Grey", "catie guey": "Catie Grey",
+        "catie": "Catie Grey", "grey": "Catie Grey",
         # Abigail
         "abigail": "Abigail", "abigai": "Abigail", "abigal": "Abigail",
         "abiguito": "Abigail", "abiguit": "Abigail", "abigui": "Abigail",
@@ -1910,6 +2044,11 @@ class ToyoSchedulerApp:
         "bryon": "Bryan", "bryar": "Bryan", "boyar": "Bryan",
         # Jazz
         "jazz": "Jazz", "jozz": "Jazz", "jass": "Jazz", "jaz": "Jazz",
+        "j2z": "Jazz", "j2zz": "Jazz", "jaet": "Jazz", "jaze": "Jazz",
+        "joz": "Jazz", "jas": "Jazz",
+        "ja3z": "Jazz", "j3zz": "Jazz", "j3z": "Jazz",
+        "ja33": "Jazz", "j33": "Jazz", "ja3": "Jazz",
+        "ja2z": "Jazz", "j2zz": "Jazz", "ja2": "Jazz", "jaz2": "Jazz",
         # Will
         "will": "Will", "wili": "Will", "wiil": "Will",
         # Andy
@@ -1930,13 +2069,32 @@ class ToyoSchedulerApp:
                           "4:30", "4:00", "6:00", "close", "8:30"]
 
     def _get_ocr_reader(self):
-        """Load EasyOCR reader once, cache on instance."""
-        if not hasattr(self, "_ocr_reader"):
-            self._ocr_reader = easyocr.Reader(['en'], gpu=False)
-        return self._ocr_reader
+        """Start OCR worker subprocess (Python 3.12 venv), cache on instance."""
+        if not hasattr(self, "_ocr_proc") or self._ocr_proc.poll() is not None:
+            import subprocess, json
+            self._ocr_proc = subprocess.Popen(
+                [str(_OCR_VENV_PYTHON), str(_OCR_WORKER)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True)
+            # Wait for "ready" signal
+            ready = json.loads(self._ocr_proc.stdout.readline())
+            if ready.get("status") != "ready":
+                raise RuntimeError("OCR worker failed to start")
+        return self._ocr_proc
+
+    def _paddle_readtext(self, reader_proc, img_path, **kwargs):
+        """Send image to OCR worker subprocess, return (bbox, text, conf) list."""
+        import json
+        request = json.dumps({"cmd": "ocr", "path": str(img_path)})
+        reader_proc.stdin.write(request + "\n")
+        reader_proc.stdin.flush()
+        response = json.loads(reader_proc.stdout.readline())
+        if "error" in response:
+            raise RuntimeError(f"OCR error: {response['error']}")
+        return [(r[0], r[1], r[2]) for r in response["results"]]
 
     def _run_ocr(self, filepath):
-        """Run EasyOCR on the image using OpenCV grid detection."""
+        """Run PaddleOCR on the image using OpenCV grid detection."""
         reader = self._get_ocr_reader()
 
         img_cv = cv2.imread(filepath)
@@ -2035,6 +2193,8 @@ class ToyoSchedulerApp:
                 text_clean = text_clean.replace(ch, "")
             # Strip trailing/leading digits (checkmarks misread as numbers)
             text_clean = text_clean.strip("0123456789 ")
+            # Also try alias with embedded digits removed (e.g. "j2z" -> "jz")
+            text_no_digits = "".join(c for c in text_clean if not c.isdigit())
             if len(text_clean) < 1:
                 return None
 
@@ -2049,9 +2209,11 @@ class ToyoSchedulerApp:
                     if ch in words:
                         return name
 
-            # Exact alias
+            # Exact alias (also try with digits removed)
             if text_clean in self.NAME_ALIASES:
                 return self.NAME_ALIASES[text_clean]
+            if text_no_digits and text_no_digits != text_clean and text_no_digits in self.NAME_ALIASES:
+                return self.NAME_ALIASES[text_no_digits]
             # Alias substring
             for alias, canonical in self.NAME_ALIASES.items():
                 if len(alias) >= 3 and alias in text_clean:
@@ -2103,8 +2265,23 @@ class ToyoSchedulerApp:
                 return "night"
             return None
 
+        def detect_row_role(label_text):
+            """Detect whether a row is for hosts or servers."""
+            lt = label_text.lower()
+            if any(kw in lt for kw in ["hostess", "host"]):
+                return "host"
+            if any(kw in lt for kw in ["server", "buser"]):
+                return "server"
+            return None
+
+        # Build role lookup for staff
+        staff_roles = {}
+        for s in self.data.staff:
+            if s["active"]:
+                staff_roles[s["name"]] = set(s.get("roles", []))
+
         # --- Step 1: Detect day columns from header ---
-        # Run EasyOCR on header area to find day names
+        # Run PaddleOCR on header area to find day names
         day_for_col = {}
 
         # Find the header row: first row with printed day names
@@ -2121,7 +2298,7 @@ class ToyoSchedulerApp:
                 if cx2 - cx1 < 20:
                     continue
                 tmp_path = preprocess_cell(cx1, hy1 + 3, cx2, hy2 - 3)
-                results = reader.readtext(tmp_path, text_threshold=0.3)
+                results = self._paddle_readtext(reader, tmp_path)
                 os.unlink(tmp_path)
                 for _, text, _ in results:
                     day = fuzzy_match_day(text)
@@ -2131,6 +2308,7 @@ class ToyoSchedulerApp:
 
         # --- Step 2: Detect row labels and shifts ---
         row_shifts = {}  # row_index -> "morning" / "night" / None
+        row_roles = {}   # row_index -> "host" / "server" / None
         for ri in range(len(h_positions) - 1):
             ry1, ry2 = h_positions[ri], h_positions[ri + 1]
             if ry2 - ry1 < 15:
@@ -2139,12 +2317,15 @@ class ToyoSchedulerApp:
             lx1 = v_positions[0] + 3
             lx2 = v_positions[1] - 3 if len(v_positions) > 1 else img_width // 8
             tmp_path = preprocess_cell(lx1, ry1 + 3, lx2, ry2 - 3)
-            results = reader.readtext(tmp_path, text_threshold=0.3)
+            results = self._paddle_readtext(reader, tmp_path)
             os.unlink(tmp_path)
             label_text = " ".join(t for _, t, _ in results)
             shift = detect_shift(label_text)
             if shift:
                 row_shifts[ri] = shift
+            role = detect_row_role(label_text)
+            if role:
+                row_roles[ri] = role
 
         # --- Step 3: OCR each data cell ---
         detected_names = {}  # name -> {day -> set of shifts}
@@ -2155,6 +2336,7 @@ class ToyoSchedulerApp:
             if ry2 - ry1 < 30:
                 continue
             row_shift = row_shifts.get(ri)
+            row_role = row_roles.get(ri)  # "host", "server", or None
             # Skip header rows (no shift detected and near top)
             if row_shift is None and ri < 2:
                 continue
@@ -2167,12 +2349,13 @@ class ToyoSchedulerApp:
                     continue
 
                 tmp_path = preprocess_cell(cx1, ry1 + 3, cx2, ry2 - 3)
-                results = reader.readtext(
-                    tmp_path, text_threshold=0.15, low_text=0.15, width_ths=0.3)
+                results = self._paddle_readtext(reader, tmp_path)
                 os.unlink(tmp_path)
 
                 for _, text, conf in results:
                     if not text or len(text.strip()) < 1:
+                        continue
+                    if conf < 0.5:
                         continue
                     # Split on common separators: &, "and", newlines, slashes
                     parts = [text]
@@ -2200,11 +2383,16 @@ class ToyoSchedulerApp:
                     for part in parts:
                         name = fuzzy_match_name(part)
                         if name:
+                            # Skip if this row's role doesn't match the staff member's roles
+                            if row_role and name in staff_roles:
+                                if row_role not in staff_roles[name]:
+                                    continue
                             if name not in detected_names:
                                 detected_names[name] = {}
                             if name not in raw_ocr_texts:
                                 raw_ocr_texts[name] = set()
-                            raw_ocr_texts[name].add(part.strip())
+                            role_tag = f"[{row_role}]" if row_role else ""
+                            raw_ocr_texts[name].add(f"{part.strip()} {role_tag}".strip())
                             shift = row_shift or "both"
                             if day not in detected_names[name]:
                                 detected_names[name][day] = set()
@@ -2236,10 +2424,12 @@ class ToyoSchedulerApp:
 
     def _run_ocr_fallback(self, filepath, reader, known_names):
         """Fallback OCR when grid detection fails — run on full image."""
-        results = reader.readtext(filepath, text_threshold=0.2, low_text=0.2)
+        results = self._paddle_readtext(reader, filepath)
         detected_names = {}
         raw_ocr_texts = {}
-        for _, text, _ in results:
+        for _, text, conf in results:
+            if conf < 0.4:
+                continue
             text_clean = text.strip().lower()
             for ch in "✓✔☑▪•|[]{}()_~#@!$%^&*+=<>\"'/\\.,;:":
                 text_clean = text_clean.replace(ch, "")
@@ -2304,8 +2494,7 @@ class ToyoSchedulerApp:
 
         # Build staff groups
         active = [s for s in self.data.staff if s["active"]
-                  and "manager" not in s["roles"]
-                  and "emergency_only" not in s.get("flags", [])]
+                  and "manager" not in s["roles"]]
         servers = [s for s in active if "server" in s["roles"]]
         hosts = [s for s in active if "host" in s["roles"]]
         servers.sort(key=lambda s: s["name"])
@@ -2344,6 +2533,10 @@ class ToyoSchedulerApp:
             for staff in staff_list:
                 name = staff["name"]
                 display = find_display(name, name_list)
+                # Dual-role staff: only show in their preferred role section
+                is_dual = "server" in staff["roles"] and "host" in staff["roles"]
+                if is_dual and staff.get("role_preference") and staff["role_preference"] != role_key:
+                    continue
                 # Fixed schedule staff use their set schedule
                 if staff.get("fixed_schedule"):
                     default_avail = staff.get("default_availability", {})
@@ -2495,30 +2688,39 @@ class ToyoSchedulerApp:
                     lb.bind("<Key>", on_key)
                     lb.bind("<Down>", on_arrow)
                     lb.bind("<Up>", on_arrow)
+                    lb.bind("<Escape>", lambda e: popup.destroy())
                     popup.update_idletasks()
                     lb.focus_force()
-                    def close_if_outside(event):
-                        try:
-                            w = event.widget
-                            if w != lb and w != popup and not str(w).startswith(str(popup)):
-                                popup.destroy()
-                        except tk.TclError:
-                            pass
-                    popup.bind("<FocusOut>", lambda e: popup.after(100, lambda: close_popup_safe(popup)))
 
-                    def close_popup_safe(p):
-                        try:
-                            if not p.focus_get() or not str(p.focus_get()).startswith(str(p)):
-                                p.destroy()
-                        except (tk.TclError, AttributeError):
-                            pass
+                    # Close popup when clicking anywhere outside it
+                    def _make_close_handler(p, toplevel):
+                        def handler(event):
+                            try:
+                                p_str = str(p)
+                                w_str = str(event.widget)
+                                if w_str != p_str and not w_str.startswith(p_str + "."):
+                                    p.destroy()
+                            except tk.TclError:
+                                pass
+                        def cleanup(event):
+                            if event.widget == p:
+                                try:
+                                    toplevel.unbind("<Button-1>")
+                                except tk.TclError:
+                                    pass
+                        return handler, cleanup
+                    _toplevel = parent.winfo_toplevel()
+                    _click_handler, _destroy_handler = _make_close_handler(popup, _toplevel)
+                    _toplevel.bind("<Button-1>", _click_handler, add="+")
+                    popup.bind("<Destroy>", _destroy_handler)
 
                 add_btn.bind("<Button-1>", open_popup)
 
             refresh()
             return cell
 
-        def add_section(row, title, name_list, role_key):
+        def add_shift_section(row, title, name_list, role_key, shift, color):
+            """Add a single shift-role section to the OCR confirmation."""
             ttk.Label(inner, text=title,
                       font=("Helvetica", 12, "bold"), foreground="navy").grid(
                 row=row, column=0, columnspan=8, padx=5, pady=(10, 3), sticky="w")
@@ -2530,23 +2732,11 @@ class ToyoSchedulerApp:
                           width=16).grid(row=row, column=di + 1, padx=2, pady=3)
             row += 1
 
-            # Morning
-            ttk.Label(inner, text="Morning",
-                      font=("Helvetica", 10, "bold"), foreground="darkorange").grid(
+            ttk.Label(inner, text=shift.capitalize(),
+                      font=("Helvetica", 10, "bold"), foreground=color).grid(
                 row=row, column=0, padx=5, pady=(5, 2), sticky="nw")
             for di, day in enumerate(DAYS):
-                key = (role_key, "morning", day)
-                names = ocr_cells.get(key, [])
-                cell = make_ocr_cell(inner, names, name_list, row, di + 1)
-                ocr_cell_widgets[key] = cell
-            row += 1
-
-            # Night
-            ttk.Label(inner, text="Night",
-                      font=("Helvetica", 10, "bold"), foreground="darkblue").grid(
-                row=row, column=0, padx=5, pady=(8, 2), sticky="nw")
-            for di, day in enumerate(DAYS):
-                key = (role_key, "night", day)
+                key = (role_key, shift, day)
                 names = ocr_cells.get(key, [])
                 cell = make_ocr_cell(inner, names, name_list, row, di + 1)
                 ocr_cell_widgets[key] = cell
@@ -2555,11 +2745,27 @@ class ToyoSchedulerApp:
             return row
 
         row = 0
-        row = add_section(row, "SERVERS", server_names, "server")
+
+        # Layout matches sign-up sheet order
+        row = add_shift_section(row, "HOST — MORNING", host_names, "host", "morning", "darkorange")
+
         ttk.Separator(inner, orient="horizontal").grid(
             row=row, column=0, columnspan=8, sticky="ew", pady=8)
         row += 1
-        row = add_section(row, "HOSTS", host_names, "host")
+
+        row = add_shift_section(row, "SERVER — LUNCH", server_names, "server", "morning", "darkorange")
+
+        ttk.Separator(inner, orient="horizontal").grid(
+            row=row, column=0, columnspan=8, sticky="ew", pady=8)
+        row += 1
+
+        row = add_shift_section(row, "HOST — DINNER", host_names, "host", "night", "darkblue")
+
+        ttk.Separator(inner, orient="horizontal").grid(
+            row=row, column=0, columnspan=8, sticky="ew", pady=8)
+        row += 1
+
+        row = add_shift_section(row, "SERVER — DINNER", server_names, "server", "night", "darkblue")
 
         # Buttons
         btn_frame = ttk.Frame(dialog)
@@ -2724,19 +2930,21 @@ class ToyoSchedulerApp:
             for di, day in enumerate(DAYS):
                 hibachi_lunch = self.current_schedule[day]["hibachi_lunch_servers"]
                 servers = self.current_schedule[day]["lunch_servers"]
-                combined = hibachi_lunch + servers
                 letters = self.current_schedule[day].get("lunch_server_letters", {})
+                hib_set = set(hibachi_lunch)
+                # Sort by letter, hibachi after regular within same letter
+                combined = servers + hibachi_lunch
+                combined.sort(key=lambda n: (letters.get(n, "Z"), 1 if n in hib_set else 0))
                 mids = self.current_schedule[day].get("mid_servers", [])
                 if si < len(combined):
                     name = combined[si]
                     letter = letters.get(name, chr(65 + si))
                     mid = "*" if name in mids else ""
                     is_hib = name in hibachi_lunch
+                    text = f"{name} {letter}{mid}"
                     if is_hib:
-                        text = f"<{name} {letter}>{mid}"
                         bg = "#FFE4B5"
                     else:
-                        text = f"{name} {letter}{mid}"
                         bg = "#E8F5E9" if mid else "white"
                     lbl = tk.Label(self.sched_inner, text=text, width=18,
                                   font=("Helvetica", 9), anchor="center",
@@ -2795,8 +3003,11 @@ class ToyoSchedulerApp:
             for di, day in enumerate(DAYS):
                 hibachi = self.current_schedule[day]["hibachi_servers"]
                 servers = self.current_schedule[day]["dinner_servers"]
-                combined = hibachi + servers
                 letters = self.current_schedule[day].get("dinner_server_letters", {})
+                hib_set = set(hibachi)
+                # Sort by letter, hibachi after regular within same letter
+                combined = servers + hibachi
+                combined.sort(key=lambda n: (letters.get(n, "Z"), 1 if n in hib_set else 0))
                 mids = self.current_schedule[day].get("mid_servers", [])
                 if si < len(combined):
                     name = combined[si]
@@ -2867,8 +3078,6 @@ class ToyoSchedulerApp:
 
         for s in self.data.staff:
             if not s["active"] or "manager" in s["roles"]:
-                continue
-            if "emergency_only" in s.get("flags", []):
                 continue
             name = s["name"]
 

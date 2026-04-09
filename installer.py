@@ -17,6 +17,9 @@ VENV_DIR = Path.home() / ".toyo_scheduler" / "venv"
 PYTHON = VENV_DIR / "bin" / "python3"
 PIP = VENV_DIR / "bin" / "pip"
 
+OCR_VENV_DIR = Path.home() / ".toyo_scheduler" / "ocr_venv"
+OCR_PYTHON = OCR_VENV_DIR / "bin" / "python3"
+
 
 def check_venv():
     return PYTHON.exists()
@@ -36,14 +39,20 @@ def check_core_deps():
 
 
 def check_ocr_deps():
-    """Check if TrOCR dependencies are installed."""
-    if not check_venv():
+    """Check if PaddleOCR dependencies are installed in the OCR venv."""
+    if not OCR_PYTHON.exists():
         return False
     try:
         result = subprocess.run(
-            [str(PYTHON), "-c", "import easyocr; import cv2"],
-            capture_output=True, timeout=15)
-        return result.returncode == 0
+            [str(OCR_PYTHON), "-c", "from paddleocr import PaddleOCR"],
+            capture_output=True, timeout=30)
+        # Also check that opencv is in the main venv
+        if result.returncode != 0:
+            return False
+        result2 = subprocess.run(
+            [str(PYTHON), "-c", "import cv2"],
+            capture_output=True, timeout=10)
+        return result2.returncode == 0
     except Exception:
         return False
 
@@ -103,7 +112,7 @@ class InstallerWindow:
         self.install_ocr_var = tk.BooleanVar(value=True)
         self.ocr_check = ttk.Checkbutton(
             self.root,
-            text="Install OCR support (reads schedules from photos, ~4 GB download)",
+            text="Install OCR support (reads schedules from photos, ~1.5 GB download)",
             variable=self.install_ocr_var)
         self.ocr_check.pack(pady=(10, 5), padx=20, anchor="w")
 
@@ -202,12 +211,73 @@ class InstallerWindow:
 
             # Step 3: Install OCR if selected
             if self.install_ocr_var.get() and not check_ocr_deps():
-                self._update_status("Installing OCR libraries (this may take a while)...")
+                # Install opencv in main venv
+                self._update_status("Installing OpenCV...")
                 result = subprocess.run(
-                    [str(PIP), "install", "easyocr", "opencv-python-headless"],
+                    [str(PIP), "install", "--quiet", "opencv-python-headless"],
                     capture_output=True, text=True, timeout=300)
                 if result.returncode != 0:
-                    self._show_error(f"Failed to install OCR:\n{result.stderr}")
+                    self._show_error(f"Failed to install OpenCV:\n{result.stderr}")
+                    return
+
+                # Create OCR venv with Python 3.12 (PaddlePaddle needs <=3.12)
+                self._update_status("Setting up OCR environment...")
+                if not OCR_PYTHON.exists():
+                    # Try uv first, fall back to python3.12 directly
+                    uv_bin = Path.home() / ".local" / "bin" / "uv"
+                    if uv_bin.exists():
+                        result = subprocess.run(
+                            [str(uv_bin), "venv", str(OCR_VENV_DIR), "--python", "3.12"],
+                            capture_output=True, text=True)
+                    else:
+                        result = subprocess.run(
+                            ["python3.12", "-m", "venv", str(OCR_VENV_DIR)],
+                            capture_output=True, text=True)
+                    if result.returncode != 0:
+                        self._show_error(
+                            "Failed to create OCR environment. Python 3.12 is required "
+                            "for PaddleOCR.\n\nInstall it with: curl -LsSf "
+                            "https://astral.sh/uv/install.sh | sh && uv python install 3.12"
+                            f"\n\n{result.stderr}")
+                        return
+
+                self._update_status("Installing PaddleOCR (this may take a while)...")
+                # Use uv pip if available, otherwise fall back to pip
+                uv_bin = Path.home() / ".local" / "bin" / "uv"
+                ocr_pip = OCR_VENV_DIR / "bin" / "pip"
+                if uv_bin.exists():
+                    result = subprocess.run(
+                        [str(uv_bin), "pip", "install",
+                         "--python", str(OCR_PYTHON),
+                         "paddlepaddle>=3.0,<3.1", "paddleocr>=3.0"],
+                        capture_output=True, text=True, timeout=600)
+                elif ocr_pip.exists():
+                    result = subprocess.run(
+                        [str(ocr_pip), "install",
+                         "paddlepaddle>=3.0,<3.1", "paddleocr>=3.0"],
+                        capture_output=True, text=True, timeout=600)
+                else:
+                    result = subprocess.run(
+                        [str(OCR_PYTHON), "-m", "pip", "install",
+                         "paddlepaddle>=3.0,<3.1", "paddleocr>=3.0"],
+                        capture_output=True, text=True, timeout=600)
+                if result.returncode != 0:
+                    self._show_error(f"Failed to install PaddleOCR:\n{result.stderr}")
+                    return
+
+                # Pre-download OCR models so first use is instant
+                self._update_status("Downloading OCR models...")
+                result = subprocess.run(
+                    [str(OCR_PYTHON), "-c",
+                     "import os; os.environ['PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK']='True'; "
+                     "from paddleocr import PaddleOCR; "
+                     "PaddleOCR(lang='en', device='cpu', "
+                     "use_doc_orientation_classify=False, "
+                     "use_doc_unwarping=False, "
+                     "use_textline_orientation=False)"],
+                    capture_output=True, text=True, timeout=300)
+                if result.returncode != 0:
+                    self._show_error(f"Failed to download OCR models:\n{result.stderr}")
                     return
                 self._update_label(self.ocr_status, "Installed", "green")
 
