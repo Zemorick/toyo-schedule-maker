@@ -57,6 +57,20 @@ HIBACHI_SENIOR_NAMES = {"Andy", "Dian", "Leony"}
 def hibachi_target(name):
     return HIBACHI_TARGET_SENIOR if name in HIBACHI_SENIOR_NAMES else HIBACHI_TARGET_DEFAULT
 
+
+def name_first_shift_in_day(day_dict, name):
+    """Return 'lunch' if `name` first appears in this day's lunch lists,
+    else 'dinner' if they appear in dinner, else None. Used to decide
+    where the midshift '*' marker shows — only on the FIRST shift of the
+    day so a person who works lunch + dinner gets one marker, not two."""
+    if (name in day_dict.get("lunch_servers", [])
+            or name in day_dict.get("hibachi_lunch_servers", [])):
+        return "lunch"
+    if (name in day_dict.get("dinner_servers", [])
+            or name in day_dict.get("hibachi_servers", [])):
+        return "dinner"
+    return None
+
 LUNCH_SERVER_TIME = "(10:15-2:15)"
 LUNCH_HOST_TIMES = ["(10:15-4:15)", "(10:15-2:15)"]
 LUNCH_MANAGER_TIME = "(10:15-4:15) "
@@ -994,6 +1008,7 @@ class ExcelExporter:
             row = 3
             for name in combined:
                 letter = letters.get(name, chr(65 + row - 3))
+                # Excel: * marker on every appearance, no color
                 mid_mark = "*" if name in mids else ""
                 if name in b_set:
                     ws[f"{col}{row}"] = f"<{name} {letter}>{mid_mark}"
@@ -1086,6 +1101,7 @@ class ExcelExporter:
             row = 21
             for name in combined:
                 letter = letters.get(name, chr(65 + row - 21))
+                # Excel: * marker on every appearance, no color
                 mid_mark = "*" if name in mids else ""
                 if name in b_set:
                     ws[f"{col}{row}"] = f"<{name} {letter}>{mid_mark}"
@@ -1449,7 +1465,7 @@ class _ExplorerGame:
     HUD_HEIGHT = 38
     FRAME_MS = 90   # ~11 FPS
 
-    SWORD_RANGE = 2.2     # was 3.6 — shorter reach, get closer to swing
+    SWORD_RANGE = 2.9     # mid-range reach
     SWORD_SPLASH = 1.4
     SWORD_COOLDOWN = 16   # was 7 — slower swing makes the game harder
     ENEMY_HP = 3
@@ -1464,8 +1480,9 @@ class _ExplorerGame:
     SOUL_LATE_THRESHOLD = 5       # after this many "in flight", switch to LATE rate
     SOUL_TTL_FRAMES = 111         # ~10 seconds at FRAME_MS=90
     NUM_TORCHES = 7
-    POWERUP_DAMAGE_DROP_RATE = 0.01
-    POWERUP_HEART_DROP_RATE = 0.01
+    POWERUP_DAMAGE_DROP_RATE = 0.125
+    POWERUP_HEART_DROP_RATE = 0.125
+    POWERUP_TTL_FRAMES = 167      # ~15 seconds before a dropped power-up vanishes
     DAMAGE_BOOST_FRAMES = 167     # ~15 seconds of 2x sword damage
     BOMB_RADIUS = 4.0             # tiles affected by the soul-bomb cheat
     BOMB_ANIM_FRAMES = 6
@@ -1473,8 +1490,24 @@ class _ExplorerGame:
     PLAYER_IFRAMES = 14
     VISIBILITY_THRESHOLD = 0.15  # enemies below this light intensity stay hidden
 
-    def __init__(self, parent):
+    # Hidden recruits unlocked by beating the game. Roles deliberately not
+    # surfaced in the UI — the player picks blind.
+    SHADOW_REALM_RECRUITS = [
+        {"name": "DC",      "roles": ["server"],         "role_preference": "server"},
+        {"name": "Thomas",  "roles": ["server"],         "role_preference": "server"},
+        {"name": "Jessica", "roles": ["host"],           "role_preference": "host"},
+        {"name": "Lynn",    "roles": ["server", "host"], "role_preference": None},
+        {"name": "Johnny",  "roles": ["server", "host"], "role_preference": None},
+        {"name": "Steven",  "roles": ["server", "host"], "role_preference": None},
+        {"name": "Grace",   "roles": ["server", "host"], "role_preference": None},
+    ]
+
+    def __init__(self, parent, data=None):
         self.win = tk.Toplevel(parent)
+        # DataManager — used by the win-screen recruit popup to add a new
+        # staff member to the roster. Optional so the game can still run
+        # standalone for testing.
+        self.data = data
         self.win.title("???")
         self.win.resizable(False, False)
         self.win.configure(bg="black")
@@ -1530,6 +1563,10 @@ class _ExplorerGame:
         # Hidden cheat: B consumes one carried soul as a mid-range bomb.
         self.win.bind("b", lambda e: self._bomb())
         self.win.bind("B", lambda e: self._bomb())
+        # DEBUG: Backspace skips straight to the recruit popup so we can
+        # test the win flow without playing the whole game. Remove once
+        # the recruit feature is approved.
+        self.win.bind("<BackSpace>", lambda e: self._show_recruit_popup())
         self.win.bind("<Escape>", lambda e: self._close())
         self.win.protocol("WM_DELETE_WINDOW", self._close)
         self.win.focus_set()
@@ -1657,10 +1694,12 @@ class _ExplorerGame:
                 if random.random() < self.POWERUP_DAMAGE_DROP_RATE:
                     self.power_ups.append({
                         "x": ex_int, "y": ey_int, "kind": "damage",
+                        "ttl": self.POWERUP_TTL_FRAMES,
                     })
                 if random.random() < self.POWERUP_HEART_DROP_RATE:
                     self.power_ups.append({
                         "x": ex_int, "y": ey_int, "kind": "heart",
+                        "ttl": self.POWERUP_TTL_FRAMES,
                     })
             else:
                 survivors.append(e)
@@ -1773,6 +1812,10 @@ class _ExplorerGame:
             s["ttl"] -= 1
         self.souls = [s for s in self.souls if s["ttl"] > 0]
         self.carried_souls = [t - 1 for t in self.carried_souls if t - 1 > 0]
+        # Tick power-up TTLs and prune expired
+        for p in self.power_ups:
+            p["ttl"] = p.get("ttl", self.POWERUP_TTL_FRAMES) - 1
+        self.power_ups = [p for p in self.power_ups if p["ttl"] > 0]
         self._spawn_counter += 1
         if self._spawn_counter >= self.SPAWN_INTERVAL:
             self._spawn_counter = 0
@@ -1793,7 +1836,90 @@ class _ExplorerGame:
     def _win(self):
         self.won = True
         self._draw_win_screen()
-        self.win.after(5000, self._close)
+        # After the win screen sits for a moment, open the Shadow Realm
+        # recruit picker. The picker is responsible for closing the game.
+        self.win.after(5000, self._show_recruit_popup)
+
+    def _show_recruit_popup(self):
+        """Win-screen recruit picker. Lets the player add ONE Shadow Realm
+        staff member to the roster. Roles are intentionally hidden — the
+        dropdown shows names only. Bound to BackSpace as a debug shortcut."""
+        if self.data is None:
+            self._close()
+            return
+        # Filter out anyone already on the roster so the player can't add a
+        # duplicate name (would error out the staff editor).
+        existing = {s["name"] for s in self.data.staff}
+        available = [r for r in self.SHADOW_REALM_RECRUITS if r["name"] not in existing]
+        if not available:
+            messagebox.showinfo(
+                "The Shadow Realm",
+                "All Shadow Realm souls have already joined Toyo.",
+                parent=self.win)
+            self._close()
+            return
+
+        popup = tk.Toplevel(self.win)
+        popup.title("The Shadow Realm")
+        popup.geometry("440x220")
+        popup.configure(bg="black")
+        popup.resizable(False, False)
+        popup.transient(self.win)
+        popup.after(50, lambda: popup.grab_set() if popup.winfo_exists() else None)
+
+        tk.Label(popup,
+                 text="Who would you like to recruit",
+                 font=("Helvetica", 13, "bold"),
+                 bg="black", fg="white").pack(pady=(22, 0))
+        tk.Label(popup,
+                 text="from The Shadow Realm?",
+                 font=("Helvetica", 13, "bold"),
+                 bg="black", fg="#FFD54F").pack(pady=(0, 14))
+
+        name_var = tk.StringVar(value=available[0]["name"])
+        combo = ttk.Combobox(popup, textvariable=name_var,
+                             values=[r["name"] for r in available],
+                             state="readonly", width=22,
+                             font=("Helvetica", 12))
+        combo.pack(pady=4)
+
+        def confirm():
+            chosen_name = name_var.get()
+            chosen = next((r for r in available if r["name"] == chosen_name), None)
+            if chosen:
+                new_staff = {
+                    "name": chosen["name"],
+                    "roles": list(chosen["roles"]),
+                    "seniority": 5,
+                    "fixed_schedule": False,
+                    "active": True,
+                    # Exclusive flag awarded by clearing the easter egg.
+                    # Visual-only — no scheduling effect — and the staff
+                    # dialog cannot set or unset it.
+                    "flags": ["ABSOLUTE EMERGENCY"],
+                    "role_preference": chosen["role_preference"],
+                    "default_off": [],
+                }
+                self.data.staff.append(new_staff)
+                try:
+                    self.data.save_staff()
+                except Exception:
+                    pass
+            try:
+                popup.destroy()
+            except tk.TclError:
+                pass
+            self._close()
+
+        tk.Button(popup, text="Recruit",
+                  font=("Helvetica", 11, "bold"),
+                  bg="#4CAF50", fg="white",
+                  activebackground="#388E3C", activeforeground="white",
+                  relief="raised", bd=2, cursor="hand2",
+                  command=confirm).pack(pady=18, ipadx=14, ipady=4)
+
+        popup.protocol("WM_DELETE_WINDOW",
+                       lambda: (popup.destroy(), self._close()))
 
     def _trigger_game_over(self):
         self.game_over = True
@@ -1894,6 +2020,14 @@ class _ExplorerGame:
             sr = 1.0 + 2.6 * ttl_ratio + random.uniform(-0.15, 0.15)
             sources.append((s["x"] + 0.5, s["y"] + 0.5, sr, "blue"))
 
+        # Bomb flash — while the bomb anim is playing, drop a huge blue
+        # light source on the player so the surrounding tiles brighten in
+        # cool blue. This is the "illuminates the darkness" effect.
+        if self.bomb_anim > 0:
+            flash_progress = self.bomb_anim / self.BOMB_ANIM_FRAMES
+            flash_radius = self.BOMB_RADIUS * 1.5 * (0.5 + 0.5 * flash_progress)
+            sources.append((self.px + 0.5, self.py + 0.5, flash_radius, "blue"))
+
         # Per-tile lighting: pick the strongest contribution and use its color.
         for y in range(self.ROWS):
             for x in range(self.COLS):
@@ -1929,13 +2063,25 @@ class _ExplorerGame:
             self._draw_flame(s["x"] * T + T // 2, s["y"] * T + T // 2 + 2,
                              hue="blue", scale=scale)
 
-        # Power-ups on the ground — always visible (slight pulse)
+        # Power-ups on the ground — only visible if their tile is lit above
+        # the visibility threshold (same rule as enemies). Walking onto an
+        # unseen power-up still picks it up; you just can't see it.
         pulse = 1.0 + math.sin(self._frame * 0.4) * 0.15
         for p in self.power_ups:
+            pcx = p["x"] + 0.5
+            pcy = p["y"] + 0.5
+            best = 0.0
+            for lx, ly, lr, _ in sources:
+                d = math.hypot(pcx - lx, pcy - ly)
+                if d < lr:
+                    i = (1.0 - d / lr) ** 1.4
+                    if i > best:
+                        best = i
+            if best < self.VISIBILITY_THRESHOLD:
+                continue
             cx = p["x"] * T + T // 2
             cy = p["y"] * T + T // 2
             if p["kind"] == "damage":
-                # Yellow diamond with bright outline
                 size = int(9 * pulse)
                 pts = [cx, cy - size, cx + size, cy,
                        cx, cy + size, cx - size, cy]
@@ -1944,7 +2090,6 @@ class _ExplorerGame:
                               fill="#5A4400", font=("Helvetica", 7, "bold"))
             elif p["kind"] == "heart":
                 size = int(9 * pulse)
-                # Heart polygon
                 pts = [
                     cx, cy + size,
                     cx + size, cy,
@@ -1999,17 +2144,24 @@ class _ExplorerGame:
                 c.create_oval(x1 - r, y1 - r, x1 + r, y1 + r,
                               outline="#9e9e9e", width=2, dash=(3, 3))
 
-        # Bomb explosion visual: expanding blue ring around the player
+        # Bomb splash: layered concentric blue rings that fade as the anim
+        # ends. The huge blue light source above already brightens the area;
+        # this is the visible "splash" overlay.
         if self.bomb_anim > 0:
             cx = self.px * T + T // 2
             cy = self.py * T + T // 2
-            progress = (self.BOMB_ANIM_FRAMES - self.bomb_anim) / self.BOMB_ANIM_FRAMES
-            r = self.BOMB_RADIUS * T * (0.35 + progress * 0.65)
-            c.create_oval(cx - r, cy - r, cx + r, cy + r,
-                          outline="#42a5f5", width=4)
-            r2 = r * 0.7
-            c.create_oval(cx - r2, cy - r2, cx + r2, cy + r2,
-                          outline="#90caf9", width=2)
+            fade = self.bomb_anim / self.BOMB_ANIM_FRAMES  # 1.0 → 0.0
+            base_r = self.BOMB_RADIUS * T
+            for mult, color, width in [
+                (1.00, "#0d47a1", 2),
+                (0.78, "#1976d2", 3),
+                (0.58, "#2196f3", 3),
+                (0.40, "#64b5f6", 4),
+                (0.24, "#bbdefb", 4),
+            ]:
+                r = base_r * mult * (0.6 + 0.4 * fade)
+                c.create_oval(cx - r, cy - r, cx + r, cy + r,
+                              outline=color, width=width)
 
         # Player (orange square) — flickers during invincibility frames
         if self.iframes == 0 or (self.iframes // 2) % 2 == 0:
@@ -2399,7 +2551,16 @@ class ToyoSchedulerApp:
                     loading.destroy()
                 except tk.TclError:
                     pass
-                _ExplorerGame(parent)
+                # Close the staff dialog (parent) so it doesn't lurk behind
+                # the game window once the easter egg launches.
+                try:
+                    if parent is not self.root:
+                        parent.destroy()
+                except tk.TclError:
+                    pass
+                # Pass DataManager so the game's win-screen recruit popup
+                # can add Shadow Realm staff to the roster.
+                _ExplorerGame(self.root, data=self.data)
                 return
             f = frames[state["i"] % len(frames)]
             label.config(text=f"Entering the Abyss{f}")
@@ -2520,6 +2681,14 @@ class ToyoSchedulerApp:
                 return
 
             flags = [f for f, v in flag_vars.items() if v.get()]
+            # Preserve flags managed outside this dialog (e.g. the exclusive
+            # ABSOLUTE EMERGENCY flag from Shadow Realm recruits) so they
+            # don't get wiped on edit.
+            if existing:
+                known_dialog_flags = set(flag_vars.keys())
+                for f in existing.get("flags", []):
+                    if f not in known_dialog_flags and f not in flags:
+                        flags.append(f)
             pref = pref_var.get()
             if pref == "none":
                 pref = None
@@ -4282,19 +4451,25 @@ class ToyoSchedulerApp:
                 if si < len(combined):
                     name = combined[si]
                     letter = letters.get(name, chr(65 + si))
-                    mid = "*" if name in mids else ""
+                    # In-app: midshift shows on EVERY cell the person appears
+                    # in for that day (text *, green BG, and the button), unless
+                    # the cell is overridden by B-side blue or hibachi orange.
+                    is_mid = name in mids
+                    mid = "*" if is_mid else ""
                     is_hib = name in hib_set
                     is_b = name in b_set
                     text = f"<{name} {letter}>{mid}" if is_b else f"{name} {letter}{mid}"
                     if is_b:
-                        bg = "#ADD8E6"  # light blue for sushi/B-side
+                        bg = "#ADD8E6"  # light blue for B-side overrides green
                     elif is_hib:
                         bg = "#FFE4B5"
+                    elif is_mid:
+                        bg = "#C8E6C9"  # green highlight for midshift
                     else:
-                        bg = "#E8F5E9" if mid else "white"
+                        bg = "white"
                     cell = tk.Frame(self.sched_inner, bg=bg, relief="groove", bd=1)
                     cell.grid(row=row + si, column=di + 1, padx=1, pady=1, sticky="nsew")
-                    lbl = tk.Label(cell, text=text, width=15,
+                    lbl = tk.Label(cell, text=text, width=13,
                                   font=("Helvetica", 9), anchor="center",
                                   bg=bg, cursor="hand2", bd=0)
                     lbl.pack(side="left", fill="both", expand=True)
@@ -4306,6 +4481,13 @@ class ToyoSchedulerApp:
                                     bg=btn_bg, fg=btn_fg, cursor="hand2", bd=1, relief="raised")
                     bbtn.pack(side="right", fill="y")
                     bbtn.bind("<Button-1>", lambda e, d=day, n=name: self._toggle_b_side(d, "lunch", n))
+                    mbtn_bg = "#4CAF50" if is_mid else "#DDDDDD"
+                    mbtn_fg = "white" if is_mid else "#333333"
+                    mbtn = tk.Label(cell, text="*", width=2,
+                                    font=("Helvetica", 10, "bold"),
+                                    bg=mbtn_bg, fg=mbtn_fg, cursor="hand2", bd=1, relief="raised")
+                    mbtn.pack(side="right", fill="y")
+                    mbtn.bind("<Button-1>", lambda e, d=day, n=name: self._toggle_mid(d, n))
         row += max(max_ls, 1) + 1
 
         # Lunch Manager
@@ -4373,19 +4555,22 @@ class ToyoSchedulerApp:
                 if si < len(combined):
                     name = combined[si]
                     letter = letters.get(name, chr(65 + si))
-                    mid = "*" if name in mids else ""
+                    is_mid = name in mids
+                    mid = "*" if is_mid else ""
                     is_hib = name in hib_set
                     is_b = name in b_set
                     text = f"<{name} {letter}>{mid}" if is_b else f"{name} {letter}{mid}"
                     if is_b:
-                        bg = "#ADD8E6"  # light blue for sushi/B-side
+                        bg = "#ADD8E6"  # light blue for B-side overrides green
                     elif is_hib:
                         bg = "#FFE4B5"
+                    elif is_mid:
+                        bg = "#C8E6C9"  # green highlight for midshift
                     else:
-                        bg = "#E8F5E9" if mid else "white"
+                        bg = "white"
                     cell = tk.Frame(self.sched_inner, bg=bg, relief="groove", bd=1)
                     cell.grid(row=row + si, column=di + 1, padx=1, pady=1, sticky="nsew")
-                    lbl = tk.Label(cell, text=text, width=15,
+                    lbl = tk.Label(cell, text=text, width=13,
                                   font=("Helvetica", 9), anchor="center",
                                   bg=bg, cursor="hand2", bd=0)
                     lbl.pack(side="left", fill="both", expand=True)
@@ -4397,6 +4582,13 @@ class ToyoSchedulerApp:
                                     bg=btn_bg, fg=btn_fg, cursor="hand2", bd=1, relief="raised")
                     bbtn.pack(side="right", fill="y")
                     bbtn.bind("<Button-1>", lambda e, d=day, n=name: self._toggle_b_side(d, "dinner", n))
+                    mbtn_bg = "#4CAF50" if is_mid else "#DDDDDD"
+                    mbtn_fg = "white" if is_mid else "#333333"
+                    mbtn = tk.Label(cell, text="*", width=2,
+                                    font=("Helvetica", 10, "bold"),
+                                    bg=mbtn_bg, fg=mbtn_fg, cursor="hand2", bd=1, relief="raised")
+                    mbtn.pack(side="right", fill="y")
+                    mbtn.bind("<Button-1>", lambda e, d=day, n=name: self._toggle_mid(d, n))
         row += max(max_ds, 1) + 1
 
         # Dinner Hosts
@@ -4474,6 +4666,21 @@ class ToyoSchedulerApp:
 
         options.sort(key=lambda x: x[1].lower())
         return options
+
+    def _toggle_mid(self, day, name):
+        """Toggle a staff member's midshift status for a day. Pure visual
+        marker — no scheduling logic. Shows a green highlight on every cell
+        the person appears in that day plus a '*' next to their name on
+        their FIRST shift of the day. The Excel export gets the '*' in the
+        same place but no fill color."""
+        if not self.current_schedule:
+            return
+        mids = self.current_schedule[day].setdefault("mid_servers", [])
+        if name in mids:
+            mids.remove(name)
+        else:
+            mids.append(name)
+        self._display_schedule()
 
     def _toggle_b_side(self, day, shift, name):
         """Toggle a staff member's B-side (sushi side) assignment for a shift.
