@@ -485,20 +485,20 @@ class ScheduleGenerator:
 
                 assigned_names = set()
 
-                # STEP 1: Pick the closer FIRST — fewest closing counts first
+                # STEP 1: Decide WHO closes — fewest closing_counts first
+                # They will be appended LAST to dinner_hosts so they occupy the latest time slot
+                closer = None
                 if slots_to_fill >= 1 and can_close:
                     closing_sorted = sorted(can_close, key=lambda h: (
                         self.closing_counts.get(h["name"], 0),
                         self._get_shift_count(h["name"]),
                         -h["seniority"]))
                     closer = closing_sorted[0]
-                    self.schedule[day]["dinner_hosts"].append(closer["name"])
-                    self._add_shift(closer["name"])
-                    self.closing_counts[closer["name"]] = self.closing_counts.get(closer["name"], 0) + 1
                     assigned_names.add(closer["name"])
 
-                # STEP 2: Fill remaining non-closing slots (prefer no_close first, then remaining can_close)
-                non_closing_slots = slots_to_fill - len(assigned_names)
+                # STEP 2: Fill early positions (hostess 1, 2, ...) with non-closers
+                # Prefer no_close staff (Maria etc.) so they never end up in the last slot
+                non_closing_slots = slots_to_fill - (1 if closer else 0)
                 no_close.sort(key=lambda h: (self._get_shift_count(h["name"]), -h["seniority"]))
                 can_close.sort(key=lambda h: (self._get_shift_count(h["name"]), -h["seniority"]))
                 non_closing_pool = no_close + [h for h in can_close if h["name"] not in assigned_names]
@@ -510,6 +510,12 @@ class ScheduleGenerator:
                         self._add_shift(h["name"])
                         assigned_names.add(h["name"])
                         non_closing_slots -= 1
+
+                # STEP 3: Append the closer LAST (takes the 4:15-9:45 slot)
+                if closer:
+                    self.schedule[day]["dinner_hosts"].append(closer["name"])
+                    self._add_shift(closer["name"])
+                    self.closing_counts[closer["name"]] = self.closing_counts.get(closer["name"], 0) + 1
 
         # Check if we need dual-role staff to fill host gaps
         for day in DAYS:
@@ -1093,6 +1099,7 @@ class ExcelExporter:
         ws["A42"].font = Font(bold=True, size=11)
         ws["B42"] = f"Mid shift server(s)  {MIDSHIFT_TIME}"
         ws["B42"].font = Font(size=11)
+        ws["A43"].fill = PatternFill(start_color="FFE5B8B7", end_color="FFE5B8B7", fill_type="solid")
         ws["B43"] = "Training shift"
         ws["B43"].font = Font(size=11)
 
@@ -2962,8 +2969,6 @@ class ToyoSchedulerApp:
 
         ttk.Button(toolbar, text="Generate Schedule",
                   command=self._generate_schedule).pack(side=tk.LEFT, padx=15)
-        ttk.Button(toolbar, text="Select Midshifts",
-                  command=self._select_midshifts).pack(side=tk.LEFT, padx=5)
 
         # Warning area
         self.warning_var = tk.StringVar(value="")
