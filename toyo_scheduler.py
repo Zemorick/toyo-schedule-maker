@@ -1484,6 +1484,8 @@ class _ExplorerGame:
     POWERUP_HEART_DROP_RATE = 0.125
     POWERUP_TTL_FRAMES = 167      # ~15 seconds before a dropped power-up vanishes
     DAMAGE_BOOST_FRAMES = 167     # ~15 seconds of 2x sword damage
+    DAMAGE_BOOST_FRAMES_2X = 334  # ~30 seconds while two boosts are stacked
+    DAMAGE_BOOST_MAX_STACKS = 2   # cap on simultaneous damage-boost stacks
     BOMB_RADIUS = 4.0             # tiles affected by the soul-bomb cheat
     BOMB_ANIM_FRAMES = 6
     PLAYER_MAX_HP = 3
@@ -1502,12 +1504,18 @@ class _ExplorerGame:
         {"name": "Grace",   "roles": ["server", "host"], "role_preference": None},
     ]
 
-    def __init__(self, parent, data=None):
+    def __init__(self, parent, data=None, on_recruit=None):
+        # Keep a reference to the launching window so the recruit popup can
+        # be reparented to it after the game window is destroyed.
+        self.parent = parent
         self.win = tk.Toplevel(parent)
         # DataManager — used by the win-screen recruit popup to add a new
         # staff member to the roster. Optional so the game can still run
         # standalone for testing.
         self.data = data
+        # Callback fired after a recruit is appended + saved, so the App
+        # can refresh its Staff treeview to show the new entry.
+        self.on_recruit = on_recruit
         self.win.title("???")
         self.win.resizable(False, False)
         self.win.configure(bg="black")
@@ -1550,7 +1558,8 @@ class _ExplorerGame:
         self.enemies = []   # {x, y, hp, kx, ky, hit_flash}
         self.souls = []     # {x, y, ttl}  — ttl in frames; despawn at 0
         self.power_ups = []  # {x, y, kind}  kind: "damage" | "heart"
-        self.damage_boost = 0  # frames remaining of 2x sword damage
+        self.damage_boost = 0  # frames remaining of damage power-up
+        self.damage_stacks = 0  # 0 = base, 1 = 2x, 2 = 3x (one-shot enemies)
         self.bomb_anim = 0  # frames remaining of soul-bomb explosion visual
 
         # Bindings — WASD only, plus space to attack
@@ -1563,10 +1572,6 @@ class _ExplorerGame:
         # Hidden cheat: B consumes one carried soul as a mid-range bomb.
         self.win.bind("b", lambda e: self._bomb())
         self.win.bind("B", lambda e: self._bomb())
-        # DEBUG: Backspace skips straight to the recruit popup so we can
-        # test the win flow without playing the whole game. Remove once
-        # the recruit feature is approved.
-        self.win.bind("<BackSpace>", lambda e: self._show_recruit_popup())
         self.win.bind("<Escape>", lambda e: self._close())
         self.win.protocol("WM_DELETE_WINDOW", self._close)
         self.win.focus_set()
@@ -1609,7 +1614,16 @@ class _ExplorerGame:
         for p in self.power_ups:
             if p["x"] == nx and p["y"] == ny:
                 if p["kind"] == "damage":
-                    self.damage_boost = self.DAMAGE_BOOST_FRAMES
+                    # Stack up to DAMAGE_BOOST_MAX_STACKS. Each pickup
+                    # refreshes the timer. At 2 stacks the timer is reset
+                    # AND extended by another 15s window (total 30s),
+                    # rewarding the rare double pickup.
+                    if self.damage_stacks < self.DAMAGE_BOOST_MAX_STACKS:
+                        self.damage_stacks += 1
+                    if self.damage_stacks >= 2:
+                        self.damage_boost = self.DAMAGE_BOOST_FRAMES_2X
+                    else:
+                        self.damage_boost = self.DAMAGE_BOOST_FRAMES
                     continue
                 elif p["kind"] == "heart":
                     if self.hp < self.PLAYER_MAX_HP:
@@ -1650,8 +1664,9 @@ class _ExplorerGame:
             return
         self.swing_target = (target["x"], target["y"])
         # Apply damage + knockback to target and anyone in splash radius.
-        # Damage doubles while a damage-boost power-up is active.
-        sword_damage = 2 if self.damage_boost > 0 else 1
+        # Damage scales with damage-boost stacks: 0 → 1, 1 → 2 (2x),
+        # 2 → 3 (3x, one-shots ENEMY_HP=3 enemies).
+        sword_damage = 1 + self.damage_stacks if self.damage_boost > 0 else 1
         for e in self.enemies:
             d = math.hypot(e["x"] - target["x"], e["y"] - target["y"])
             if d <= self.SWORD_SPLASH:
@@ -1669,6 +1684,17 @@ class _ExplorerGame:
                 e["hit_flash"] = 3
         self._process_enemy_deaths()
 
+    def _clamp_drop_to_corner(self, x, y):
+        """Return an in-bounds tile for a drop. If (x, y) is already on the
+        playfield it's returned unchanged; otherwise the drop is redirected
+        to the corner of the playfield nearest to (x, y) so the player can
+        still walk over and collect it."""
+        if 0 <= x < self.COLS and 0 <= y < self.ROWS:
+            return x, y
+        cx = 0 if x < self.COLS / 2 else self.COLS - 1
+        cy = 0 if y < self.ROWS / 2 else self.ROWS - 1
+        return cx, cy
+
     def _process_enemy_deaths(self):
         """Remove dead enemies, roll soul/power-up drops on each kill.
 
@@ -1679,6 +1705,12 @@ class _ExplorerGame:
             if e["hp"] <= 0:
                 ex_int = int(round(e["x"]))
                 ey_int = int(round(e["y"]))
+                # If knockback launched the enemy off the playfield, the
+                # rounded drop tile may end up outside the grid (or in the
+                # HUD strip), making the drop unreachable. Redirect those
+                # drops to the in-bounds corner nearest where the enemy
+                # ended up so the player can still pick them up.
+                ex_int, ey_int = self._clamp_drop_to_corner(ex_int, ey_int)
                 used = sum(1 for t in self.torches if not t["lit"])
                 in_flight = len(self.souls) + len(self.carried_souls)
                 accounted = used + in_flight
@@ -1716,7 +1748,7 @@ class _ExplorerGame:
             return
         self.carried_souls.pop(0)
         self.bomb_anim = self.BOMB_ANIM_FRAMES
-        sword_damage = 2 if self.damage_boost > 0 else 1
+        sword_damage = 1 + self.damage_stacks if self.damage_boost > 0 else 1
         bomb_damage = sword_damage * 2  # "2 sword swings worth"
         for e in self.enemies:
             d = math.hypot(e["x"] - self.px, e["y"] - self.py)
@@ -1805,6 +1837,8 @@ class _ExplorerGame:
             self.iframes -= 1
         if self.damage_boost > 0:
             self.damage_boost -= 1
+            if self.damage_boost == 0:
+                self.damage_stacks = 0
         if self.bomb_anim > 0:
             self.bomb_anim -= 1
         # Tick soul TTLs (ground + carried) and prune expired
@@ -1836,9 +1870,23 @@ class _ExplorerGame:
     def _win(self):
         self.won = True
         self._draw_win_screen()
-        # After the win screen sits for a moment, open the Shadow Realm
-        # recruit picker. The picker is responsible for closing the game.
-        self.win.after(5000, self._show_recruit_popup)
+        # Let the win screen sit for a moment, then close the game window
+        # entirely. The recruit popup appears AFTER the game closes, so it
+        # feels like a reward delivered back in the main app.
+        self.win.after(5000, self._close_then_show_recruit)
+
+    def _close_then_show_recruit(self):
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+        self.alive = False
+        # Schedule the recruit popup on the original parent so it survives
+        # the game window being destroyed.
+        try:
+            self.parent.after(250, self._show_recruit_popup)
+        except tk.TclError:
+            pass
 
     def _show_recruit_popup(self):
         """Win-screen recruit picker. Lets the player add ONE Shadow Realm
@@ -1847,6 +1895,9 @@ class _ExplorerGame:
         if self.data is None:
             self._close()
             return
+        # The popup is parented to the original launching window because by
+        # the time we get here the game window has already been destroyed.
+        popup_parent = self.parent if self.parent is not None else self.win
         # Filter out anyone already on the roster so the player can't add a
         # duplicate name (would error out the staff editor).
         existing = {s["name"] for s in self.data.staff}
@@ -1855,16 +1906,16 @@ class _ExplorerGame:
             messagebox.showinfo(
                 "The Shadow Realm",
                 "All Shadow Realm souls have already joined Toyo.",
-                parent=self.win)
+                parent=popup_parent)
             self._close()
             return
 
-        popup = tk.Toplevel(self.win)
+        popup = tk.Toplevel(popup_parent)
         popup.title("The Shadow Realm")
         popup.geometry("440x220")
         popup.configure(bg="black")
         popup.resizable(False, False)
-        popup.transient(self.win)
+        popup.transient(popup_parent)
         popup.after(50, lambda: popup.grab_set() if popup.winfo_exists() else None)
 
         tk.Label(popup,
@@ -1876,15 +1927,25 @@ class _ExplorerGame:
                  font=("Helvetica", 13, "bold"),
                  bg="black", fg="#FFD54F").pack(pady=(0, 14))
 
+        # "None" lets the player decline a recruit if they'd rather not
+        # add anyone from the Shadow Realm to the roster.
+        NONE_LABEL = "None — don't recruit anyone"
         name_var = tk.StringVar(value=available[0]["name"])
         combo = ttk.Combobox(popup, textvariable=name_var,
-                             values=[r["name"] for r in available],
-                             state="readonly", width=22,
+                             values=[r["name"] for r in available] + [NONE_LABEL],
+                             state="readonly", width=26,
                              font=("Helvetica", 12))
         combo.pack(pady=4)
 
         def confirm():
             chosen_name = name_var.get()
+            if chosen_name == NONE_LABEL:
+                try:
+                    popup.destroy()
+                except tk.TclError:
+                    pass
+                self._close()
+                return
             chosen = next((r for r in available if r["name"] == chosen_name), None)
             if chosen:
                 new_staff = {
@@ -1905,6 +1966,12 @@ class _ExplorerGame:
                     self.data.save_staff()
                 except Exception:
                     pass
+                # Notify the App so the Staff treeview picks up the new entry
+                if self.on_recruit is not None:
+                    try:
+                        self.on_recruit(new_staff)
+                    except Exception:
+                        pass
             try:
                 popup.destroy()
             except tk.TclError:
@@ -2195,15 +2262,19 @@ class _ExplorerGame:
                           fill=color, outline="")
             x_dot += 20
 
-        # Damage-boost indicator: yellow diamond with "2x" while active
+        # Damage-boost indicator: yellow diamond labelled with the active
+        # multiplier. 1 stack = 2x, 2 stacks = 3x (one-shots enemies).
         if self.damage_boost > 0:
             x_dot += 6
             size = 10
+            mult_label = f"{1 + self.damage_stacks}x"
+            # Brighter outline at 2 stacks so the boosted state is obvious.
+            outline = "#FFFFFF" if self.damage_stacks >= 2 else "#FFF59D"
             pts = [x_dot, cy_dot - size, x_dot + size, cy_dot,
                    x_dot, cy_dot + size, x_dot - size, cy_dot]
             c.create_polygon(pts, fill="#FFD700",
-                             outline="#FFF59D", width=2)
-            c.create_text(x_dot, cy_dot, text="2x",
+                             outline=outline, width=2)
+            c.create_text(x_dot, cy_dot, text=mult_label,
                           fill="#5A4400", font=("Helvetica", 8, "bold"))
 
     @staticmethod
@@ -2559,8 +2630,11 @@ class ToyoSchedulerApp:
                 except tk.TclError:
                     pass
                 # Pass DataManager so the game's win-screen recruit popup
-                # can add Shadow Realm staff to the roster.
-                _ExplorerGame(self.root, data=self.data)
+                # can add Shadow Realm staff to the roster, plus a callback
+                # so the Staff treeview refreshes immediately when a new
+                # recruit is added.
+                _ExplorerGame(self.root, data=self.data,
+                              on_recruit=lambda s: self._refresh_staff_tree())
                 return
             f = frames[state["i"] % len(frames)]
             label.config(text=f"Entering the Abyss{f}")
@@ -2591,8 +2665,10 @@ class ToyoSchedulerApp:
         roles_frame.grid(row=row, column=1, padx=10, pady=5, sticky="w")
         server_var = tk.BooleanVar(value="server" in existing["roles"] if existing else False)
         host_var = tk.BooleanVar(value="host" in existing["roles"] if existing else False)
+        manager_var = tk.BooleanVar(value="manager" in existing["roles"] if existing else False)
         ttk.Checkbutton(roles_frame, text="Server", variable=server_var).pack(side=tk.LEFT)
         ttk.Checkbutton(roles_frame, text="Host", variable=host_var).pack(side=tk.LEFT)
+        ttk.Checkbutton(roles_frame, text="Manager", variable=manager_var).pack(side=tk.LEFT)
 
         row += 1
         ttk.Label(dlg, text="Seniority (1-10):").grid(row=row, column=0, padx=10, pady=5, sticky="w")
@@ -2603,7 +2679,7 @@ class ToyoSchedulerApp:
         ttk.Label(dlg, text="Role Preference:").grid(row=row, column=0, padx=10, pady=5, sticky="w")
         pref_var = tk.StringVar(value=existing.get("role_preference", "") or "none" if existing else "none")
         pref_combo = ttk.Combobox(dlg, textvariable=pref_var,
-                                  values=["none", "server", "host"], state="readonly", width=10)
+                                  values=["none", "server", "host", "manager"], state="readonly", width=10)
         pref_combo.grid(row=row, column=1, padx=10, pady=5, sticky="w")
 
         row += 1
@@ -2676,6 +2752,8 @@ class ToyoSchedulerApp:
                 roles.append("server")
             if host_var.get():
                 roles.append("host")
+            if manager_var.get():
+                roles.append("manager")
             if not roles:
                 messagebox.showerror("Error", "Select at least one role.", parent=dlg)
                 return
