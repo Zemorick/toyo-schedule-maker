@@ -62,6 +62,37 @@ DINNER_MANAGER_TIME_WEEKEND = "(4:15-10:30)"
 APP_DIR = Path(__file__).parent
 DATA_DIR = APP_DIR / "toyo_data"
 
+# Employee font colors for Excel export (ARGB format)
+# Colors extracted from old schedule files — shared colors are intentional
+STAFF_COLORS = {
+    "Addison": "FFDE00CE",
+    "Andy": "FFFF0000",
+    "Arabella": "FF0070C0",
+    "Ashlyn": "FF00B0F0",
+    "Catie Grey": "FF4F81BD",
+    "Dian": "FFC00000",
+    "Hannah": "FF7B4B23",
+    "Jazz": "FF9900FF",
+    "Kamryn": "FF748C42",
+    "Leony": "FF3421BD",
+    "Lilly": "FFF519DB",
+    "Maddie": "FF9900FF",
+    "Makayla": "FF3B608D",
+    "Maria": "FFC00000",
+    "Olivia": "FF4D5D2C",
+    "Owen": "FF00B050",
+    "Sadie": "FFF519DB",
+    "Sam": "FF4F81BD",
+    "Trish": "FF7B4B23",
+}
+# Color pool for new employees (legible, not yellow/white/black)
+_COLOR_POOL = [
+    "FF0070C0", "FFFF0000", "FFC00000", "FF3421BD", "FF9900FF",
+    "FF00B050", "FF00B0F0", "FFDE00CE", "FFF519DB", "FF7B4B23",
+    "FF4F81BD", "FF3B608D", "FF748C42", "FF4D5D2C", "FF8064A2",
+    "FF4BACC6", "FFE36C09", "FF00B0F0", "FF7030A0", "FF002060",
+]
+
 # ---------------------------------------------------------------------------
 # Default Staff Roster
 # ---------------------------------------------------------------------------
@@ -331,6 +362,14 @@ class ScheduleGenerator:
         avail = self.data.availability
         if name in avail and day in avail[name]:
             return avail[name][day]
+        # Fall back to default_availability for fixed-schedule staff (Aaron, Chan, Dian, Leony)
+        staff = self.data.get_staff_by_name(name)
+        if staff and staff.get("fixed_schedule"):
+            default_avail = staff.get("default_availability", {})
+            if day in default_avail:
+                return default_avail[day]
+            default_off = staff.get("default_off", [])
+            return "off" if day in default_off else "both"
         return "off"
 
     def _can_work(self, name, day, shift):
@@ -419,6 +458,11 @@ class ScheduleGenerator:
                           and not self._is_assigned(h["name"], day, "morning")]
             # Sort: fewer shifts first (balance), then seniority for ties
             candidates.sort(key=lambda h: (self._get_shift_count(h["name"]), -h["seniority"]))
+            # Olivia always gets position 0 (the 10:15-4:15 slot) if available
+            olivia = next((h for h in candidates if h["name"] == "Olivia"), None)
+            if olivia:
+                candidates.remove(olivia)
+                candidates.insert(0, olivia)
             for h in candidates[:needed - len(self.schedule[day]["lunch_hosts"])]:
                 self.schedule[day]["lunch_hosts"].append(h["name"])
                 self._add_shift(h["name"])
@@ -439,18 +483,25 @@ class ScheduleGenerator:
                             and not self._is_assigned(h["name"], day, "night")
                             and "no_closing" in (self.data.get_staff_by_name(h["name"]) or {}).get("flags", [])]
 
-                # Sort non-closing by shift balance
-                no_close.sort(key=lambda h: (self._get_shift_count(h["name"]), -h["seniority"]))
-                # Sort closing candidates by shift balance
-                can_close.sort(key=lambda h: (self._get_shift_count(h["name"]), -h["seniority"]))
-
-                # Fill non-closing slots first (all but last), prefer no_close staff for these
-                non_closing_slots = slots_to_fill - 1
-                closing_slot = 1
                 assigned_names = set()
 
-                # Pick non-closing slot hosts from both pools (no_close first, then can_close)
-                non_closing_pool = no_close + can_close
+                # STEP 1: Pick the closer FIRST — fewest closing counts first
+                if slots_to_fill >= 1 and can_close:
+                    closing_sorted = sorted(can_close, key=lambda h: (
+                        self.closing_counts.get(h["name"], 0),
+                        self._get_shift_count(h["name"]),
+                        -h["seniority"]))
+                    closer = closing_sorted[0]
+                    self.schedule[day]["dinner_hosts"].append(closer["name"])
+                    self._add_shift(closer["name"])
+                    self.closing_counts[closer["name"]] = self.closing_counts.get(closer["name"], 0) + 1
+                    assigned_names.add(closer["name"])
+
+                # STEP 2: Fill remaining non-closing slots (prefer no_close first, then remaining can_close)
+                non_closing_slots = slots_to_fill - len(assigned_names)
+                no_close.sort(key=lambda h: (self._get_shift_count(h["name"]), -h["seniority"]))
+                can_close.sort(key=lambda h: (self._get_shift_count(h["name"]), -h["seniority"]))
+                non_closing_pool = no_close + [h for h in can_close if h["name"] not in assigned_names]
                 for h in non_closing_pool:
                     if non_closing_slots <= 0:
                         break
@@ -459,17 +510,6 @@ class ScheduleGenerator:
                         self._add_shift(h["name"])
                         assigned_names.add(h["name"])
                         non_closing_slots -= 1
-
-                # Pick closing slot host — fewest closing counts
-                closing_candidates = [h for h in can_close if h["name"] not in assigned_names]
-                closing_candidates.sort(key=lambda h: (
-                    self.closing_counts.get(h["name"], 0),
-                    self._get_shift_count(h["name"]),
-                    -h["seniority"]))
-                for h in closing_candidates[:closing_slot]:
-                    self.schedule[day]["dinner_hosts"].append(h["name"])
-                    self._add_shift(h["name"])
-                    self.closing_counts[h["name"]] = self.closing_counts.get(h["name"], 0) + 1
 
         # Check if we need dual-role staff to fill host gaps
         for day in DAYS:
@@ -656,18 +696,8 @@ class ScheduleGenerator:
 
         for day in DAYS:
             # --- Morning servers get A-D ---
-            # Build full letter list for total people, then split: regulars first, hibachi last
             servers = list(self.schedule[day]["lunch_servers"])
             hibachi_lunch = list(self.schedule[day]["hibachi_lunch_servers"])
-            total = len(servers) + len(hibachi_lunch)
-
-            # Build enough letters for everyone: A-D first, then doubles in order
-            letters = list(MORNING_SIDEWORK)
-            if total > len(letters):
-                for extra_letter in MORNING_EXTRA_ORDER:
-                    letters.append(extra_letter)
-                    if len(letters) >= total:
-                        break
 
             self.schedule[day]["lunch_server_letters"] = {}
 
@@ -682,25 +712,24 @@ class ScheduleGenerator:
             else:
                 ordered_regular = servers
 
-            # Regular servers get the first letters, hibachi get the last
+            # Regular servers get letters A, B, C, D... in order
+            reg_letters = list(MORNING_SIDEWORK)
+            if len(ordered_regular) > len(reg_letters):
+                for extra in MORNING_EXTRA_ORDER:
+                    reg_letters.append(extra)
+                    if len(reg_letters) >= len(ordered_regular):
+                        break
             for i, name in enumerate(ordered_regular):
-                self.schedule[day]["lunch_server_letters"][name] = letters[i]
+                self.schedule[day]["lunch_server_letters"][name] = reg_letters[i] if i < len(reg_letters) else reg_letters[-1]
 
+            # Hibachi get letters from the hibachi pool (cycles for extras, never A)
+            hibachi_pool = ["D", "C"]  # morning hibachi letters — cycle through these
             for i, name in enumerate(hibachi_lunch):
-                idx = len(ordered_regular) + i
-                self.schedule[day]["lunch_server_letters"][name] = letters[idx] if idx < len(letters) else letters[-1]
+                self.schedule[day]["lunch_server_letters"][name] = hibachi_pool[i % len(hibachi_pool)]
 
             # --- Night servers get A-H ---
-            # Regular servers first, hibachi last (hibachi gets last letters)
             dinner_regular = list(self.schedule[day]["dinner_servers"])
             dinner_hibachi = list(self.schedule[day]["hibachi_servers"])
-            all_night = dinner_regular + dinner_hibachi
-            letters = list(NIGHT_SIDEWORK)
-            if len(all_night) > len(letters):
-                for extra_letter in NIGHT_EXTRA_ORDER:
-                    letters.append(extra_letter)
-                    if len(letters) >= len(all_night):
-                        break
 
             self.schedule[day]["dinner_server_letters"] = {}
 
@@ -711,21 +740,20 @@ class ScheduleGenerator:
             else:
                 ordered_night = dinner_regular
 
-            # Build full letter list for total count
-            total_night = len(ordered_night) + len(dinner_hibachi)
-            if total_night > len(letters):
-                for extra_letter in NIGHT_EXTRA_ORDER:
-                    letters.append(extra_letter)
-                    if len(letters) >= total_night:
+            # Regular servers get letters A, B, C, D, E, F, G, H... in order
+            reg_letters = list(NIGHT_SIDEWORK)
+            if len(ordered_night) > len(reg_letters):
+                for extra in NIGHT_EXTRA_ORDER:
+                    reg_letters.append(extra)
+                    if len(reg_letters) >= len(ordered_night):
                         break
-
-            # Regular servers get the first letters, hibachi get the last
             for i, name in enumerate(ordered_night):
-                self.schedule[day]["dinner_server_letters"][name] = letters[i]
+                self.schedule[day]["dinner_server_letters"][name] = reg_letters[i] if i < len(reg_letters) else reg_letters[-1]
 
+            # Hibachi get letters from the hibachi pool (cycles for extras, never A or B)
+            hibachi_pool = ["F", "H", "G", "E"]  # dinner hibachi letters — cycle through
             for i, name in enumerate(dinner_hibachi):
-                idx = len(ordered_night) + i
-                self.schedule[day]["dinner_server_letters"][name] = letters[idx] if idx < len(letters) else letters[-1]
+                self.schedule[day]["dinner_server_letters"][name] = hibachi_pool[i % len(hibachi_pool)]
 
 
     def _balance_hibachi(self, config):
@@ -757,11 +785,12 @@ class ScheduleGenerator:
                 -(self.data.get_staff_by_name(n) or {}).get("seniority", 0)))
 
             picked = lunch_eligible[:needed]
-            # Fallback: if not enough with < 2 count, allow anyone
+            # Fallback: if not enough with < 2 count, allow anyone (but never exceed 2 for Dian/Leony)
             if len(picked) < needed:
                 remaining = needed - len(picked)
                 picked_names = set(n for n in picked)
-                fallback = [n for n in lunch if n in all_servers and n not in picked_names]
+                fallback = [n for n in lunch if n in all_servers and n not in picked_names
+                            and (n not in ("Dian", "Leony") or self.hibachi_counts.get(n, 0) < 2)]
                 fallback.sort(key=lambda n: self.hibachi_counts.get(n, 0))
                 picked.extend(fallback[:remaining])
             for name in picked:
@@ -787,11 +816,12 @@ class ScheduleGenerator:
                 -(self.data.get_staff_by_name(n) or {}).get("seniority", 0)))
 
             picked = dinner_eligible[:needed]
-            # Fallback: if not enough with < 2 count, allow anyone
+            # Fallback: if not enough with < 2 count, allow anyone (but never exceed 2 for Dian/Leony)
             if len(picked) < needed:
                 remaining = needed - len(picked)
                 picked_names = set(n for n in picked)
-                fallback = [n for n in dinner if n in all_servers and n not in picked_names]
+                fallback = [n for n in dinner if n in all_servers and n not in picked_names
+                            and (n not in ("Dian", "Leony") or self.hibachi_counts.get(n, 0) < 2)]
                 fallback.sort(key=lambda n: self.hibachi_counts.get(n, 0))
                 picked.extend(fallback[:remaining])
             for name in picked:
@@ -809,6 +839,9 @@ class ScheduleGenerator:
             for day in DAYS:
                 if name not in self.schedule[day]["dinner_servers"]:
                     continue
+                max_hib = config["staffing"][day].get("hibachi_dinner", 0)
+                if len(self.schedule[day]["hibachi_servers"]) > max_hib:
+                    continue  # Already over limit, don't swap here
                 # Find someone in hibachi on this day with count >= 2
                 for hib_name in list(self.schedule[day]["hibachi_servers"]):
                     if hib_name == "Will":
@@ -851,27 +884,48 @@ class ExcelExporter:
         thin = Side(style="thin")
         border = Border(left=thin, right=thin, top=thin, bottom=thin)
         header_font = Font(bold=True, size=11)
-        name_font = Font(size=10)
-        time_font = Font(size=9, italic=True)
-        mid_font = Font(size=10, color="0000FF")
+        day_header_font = Font(bold=True, size=14)
+        name_font = Font(size=11)
+        time_font = Font(size=11)
+        mid_font = Font(size=11, color="0000FF")
+        hibachi_fill = PatternFill(start_color="FFFFFF99", end_color="FFFFFF99", fill_type="solid")
+        thin_border = Border(left=Side(style="thin"), right=Side(style="thin"))
+        section_top = Border(left=Side(style="thin"), right=Side(style="thin"), top=Side(style="medium"))
+        section_bottom = Border(left=Side(style="thin"), right=Side(style="thin"), bottom=Side(style="medium"))
+        day_top = Border(right=Side(style="thin"), top=Side(style="medium"))
 
-        # Column widths
-        ws.column_dimensions["A"].width = 16
-        for col in ["B", "C", "D", "E", "F", "G", "H"]:
-            ws.column_dimensions[col].width = 18
+        def staff_font(name, size=11):
+            """Get a Font with the employee's assigned color."""
+            color = STAFF_COLORS.get(name)
+            if not color:
+                # Assign from pool based on hash for consistency
+                used = set(STAFF_COLORS.values())
+                available = [c for c in _COLOR_POOL if c not in used]
+                if not available:
+                    available = list(_COLOR_POOL)
+                color = available[hash(name) % len(available)]
+                STAFF_COLORS[name] = color
+            return Font(size=size, color=color[2:])  # strip FF prefix
 
-        # Row 1: Dates
+        # Column widths (match old format)
+        ws.column_dimensions["A"].width = 13.4
+        for col in ["B", "C", "D", "E", "F", "G"]:
+            ws.column_dimensions[col].width = 13.0
+        ws.column_dimensions["H"].width = 14.9
+
+        # Row 1: Dates (as datetime with short date format)
         if self.week_start:
             for i, col in enumerate(["B", "C", "D", "E", "F", "G", "H"]):
                 d = self.week_start + timedelta(days=i)
-                ws[f"{col}1"] = d.strftime("%m/%d/%Y")
-                ws[f"{col}1"].font = header_font
+                ws[f"{col}1"] = d
+                ws[f"{col}1"].font = name_font
+                ws[f"{col}1"].number_format = "MM-DD"
                 ws[f"{col}1"].alignment = Alignment(horizontal="center")
 
         # Row 2: Day names
         for i, (col, day) in enumerate(zip(["B", "C", "D", "E", "F", "G", "H"], DAYS)):
             ws[f"{col}2"] = day
-            ws[f"{col}2"].font = header_font
+            ws[f"{col}2"].font = day_header_font
             ws[f"{col}2"].alignment = Alignment(horizontal="center")
 
         # LUNCH SERVERS (rows 3-8)
@@ -887,24 +941,20 @@ class ExcelExporter:
             letters = self.schedule[day].get("lunch_server_letters", {})
             mids = self.schedule[day].get("mid_servers", [])
 
-            # Place lunch hibachi first (gold background)
-            row = 3
-            for name in hibachi_lunch:
-                letter = letters.get(name, chr(65 + row - 3))
-                mid_mark = "*" if name in mids else ""
-                ws[f"{col}{row}"] = f"{name} {letter}{mid_mark}"
-                ws[f"{col}{row}"].font = name_font
-                ws[f"{col}{row}"].alignment = Alignment(horizontal="center")
-                ws[f"{col}{row}"].fill = PatternFill(start_color="FFE4B5", end_color="FFE4B5", fill_type="solid")
-                row += 1
+            # Sort: regular by letter first, then hibachi by letter
+            hib_set = set(hibachi_lunch)
+            combined = list(servers) + list(hibachi_lunch)
+            combined.sort(key=lambda n: (letters.get(n, "Z"), 1 if n in hib_set else 0))
 
-            # Then regular lunch servers
-            for name in servers:
+            row = 3
+            for name in combined:
                 letter = letters.get(name, chr(65 + row - 3))
                 mid_mark = "*" if name in mids else ""
                 ws[f"{col}{row}"] = f"{name} {letter}{mid_mark}"
-                ws[f"{col}{row}"].font = name_font
+                ws[f"{col}{row}"].font = staff_font(name)
                 ws[f"{col}{row}"].alignment = Alignment(horizontal="center")
+                if name in hib_set:
+                    ws[f"{col}{row}"].fill = hibachi_fill
                 row += 1
 
         # LUNCH MANAGER (rows 13-14)
@@ -935,13 +985,16 @@ class ExcelExporter:
             for hi, name in enumerate(hosts):
                 if hi == 0:
                     ws[f"{col}15"] = name
+                    ws[f"{col}15"].font = staff_font(name)
                     ws[f"{col}16"] = LUNCH_HOST_TIMES[0]
+                    ws[f"{col}16"].font = time_font
                 elif hi == 1:
                     ws[f"{col}17"] = name
+                    ws[f"{col}17"].font = staff_font(name)
                     ws[f"{col}18"] = LUNCH_HOST_TIMES[1]
+                    ws[f"{col}18"].font = time_font
                 for r in [15, 16, 17, 18]:
                     if ws[f"{col}{r}"].value:
-                        ws[f"{col}{r}"].font = name_font
                         ws[f"{col}{r}"].alignment = Alignment(horizontal="center")
 
         # Transition time row 20
@@ -972,24 +1025,20 @@ class ExcelExporter:
             letters = self.schedule[day].get("dinner_server_letters", {})
             mids = self.schedule[day].get("mid_servers", [])
 
-            # Place hibachi first (gold background)
-            row = 21
-            for name in hibachi:
-                letter = letters.get(name, "W")
-                mid_mark = "*" if name in mids else ""
-                ws[f"{col}{row}"] = f"{name} {letter}{mid_mark}"
-                ws[f"{col}{row}"].font = name_font
-                ws[f"{col}{row}"].alignment = Alignment(horizontal="center")
-                ws[f"{col}{row}"].fill = PatternFill(start_color="FFE4B5", end_color="FFE4B5", fill_type="solid")
-                row += 1
+            # Sort: regular by letter first, then hibachi by letter
+            hib_set = set(hibachi)
+            combined = list(servers) + list(hibachi)
+            combined.sort(key=lambda n: (letters.get(n, "Z"), 1 if n in hib_set else 0))
 
-            # Then regular dinner servers
-            for name in servers:
+            row = 21
+            for name in combined:
                 letter = letters.get(name, chr(65 + row - 21))
                 mid_mark = "*" if name in mids else ""
                 ws[f"{col}{row}"] = f"{name} {letter}{mid_mark}"
-                ws[f"{col}{row}"].font = name_font
+                ws[f"{col}{row}"].font = staff_font(name)
                 ws[f"{col}{row}"].alignment = Alignment(horizontal="center")
+                if name in hib_set:
+                    ws[f"{col}{row}"].fill = hibachi_fill
                 row += 1
 
         # DINNER HOSTS (rows 33-38)
@@ -1014,7 +1063,7 @@ class ExcelExporter:
                 name_row = 33 + hi * 2
                 time_row = 34 + hi * 2
                 ws[f"{col}{name_row}"] = name
-                ws[f"{col}{name_row}"].font = name_font
+                ws[f"{col}{name_row}"].font = staff_font(name)
                 ws[f"{col}{name_row}"].alignment = Alignment(horizontal="center")
                 if hi < len(times):
                     ws[f"{col}{time_row}"] = times[hi]
@@ -1037,12 +1086,85 @@ class ExcelExporter:
             ws[f"{col}40"].alignment = Alignment(horizontal="center")
 
         # Legend
-        ws["B41"] = "Gold = Hibachi Servers"
-        ws["B41"].font = Font(bold=True, size=9)
+        ws["A41"].fill = hibachi_fill
+        ws["B41"] = "Hibachi Servers"
+        ws["B41"].font = Font(size=11)
         ws["A42"] = "*"
         ws["A42"].font = Font(bold=True, size=11)
         ws["B42"] = f"Mid shift server(s)  {MIDSHIFT_TIME}"
-        ws["B42"].font = Font(size=9, italic=True)
+        ws["B42"].font = Font(size=11)
+        ws["B43"] = "Training shift"
+        ws["B43"].font = Font(size=11)
+
+        # --- Apply borders and extend hibachi yellow fill ---
+        for col in ["B", "C", "D", "E", "F", "G", "H"]:
+            # Row 2: day header top border
+            ws[f"{col}2"].border = day_top
+
+            # Lunch servers (rows 3-12): thin borders, section top on row 3
+            ws[f"{col}3"].border = section_top
+            for r in range(4, 13):
+                ws[f"{col}{r}"].border = thin_border
+
+            # Extend lunch hibachi yellow fill down to row 12
+            # Find the last hibachi row in this column
+            found_hibachi = False
+            for r in range(3, 13):
+                cell = ws[f"{col}{r}"]
+                if cell.fill and cell.fill.start_color and cell.fill.start_color.rgb == "FFFFFF99":
+                    found_hibachi = True
+                elif found_hibachi:
+                    # Fill empty rows below hibachi with yellow
+                    if not cell.value:
+                        cell.fill = hibachi_fill
+                    elif cell.fill != hibachi_fill:
+                        # Next data cell without hibachi = stop
+                        break
+
+            # Lunch manager (row 13-14): section top on 13
+            ws[f"{col}13"].border = section_top
+            ws[f"{col}14"].border = thin_border
+
+            # Lunch hosts (rows 15-19): section top on 15, 17, 19
+            ws[f"{col}15"].border = section_top
+            ws[f"{col}16"].border = thin_border
+            ws[f"{col}17"].border = section_top
+            ws[f"{col}18"].border = thin_border
+            ws[f"{col}19"].border = thin_border
+
+            # Transition row 20: bottom border
+            ws[f"{col}20"].border = section_bottom
+
+            # Dinner servers (rows 21-32): section top on 21
+            ws[f"{col}21"].border = section_top
+            for r in range(22, 33):
+                ws[f"{col}{r}"].border = thin_border
+
+            # Extend dinner hibachi yellow fill down to row 32
+            found_hibachi = False
+            for r in range(21, 33):
+                cell = ws[f"{col}{r}"]
+                if cell.fill and cell.fill.start_color and cell.fill.start_color.rgb == "FFFFFF99":
+                    found_hibachi = True
+                elif found_hibachi:
+                    if not cell.value:
+                        cell.fill = hibachi_fill
+                    elif cell.fill != hibachi_fill:
+                        break
+
+            # Dinner hosts (rows 33-38): section top on 33, 35, 37
+            ws[f"{col}33"].border = section_top
+            ws[f"{col}34"].border = thin_border
+            ws[f"{col}35"].border = section_top
+            ws[f"{col}36"].border = thin_border
+            ws[f"{col}37"].border = section_top
+            ws[f"{col}38"].border = thin_border
+
+            # Dinner manager (rows 39-40): section top and bottom
+            ws[f"{col}39"].border = Border(
+                left=Side(style="thin"), right=Side(style="thin"),
+                top=Side(style="medium"), bottom=Side(style="medium"))
+            ws[f"{col}40"].border = thin_border
 
         wb.save(filepath)
         return filepath
